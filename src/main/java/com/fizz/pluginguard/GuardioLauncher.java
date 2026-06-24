@@ -455,7 +455,7 @@ public final class GuardioLauncher {
         Process proc = new ProcessBuilder(cmd).directory(serverRoot).inheritIO().start();
         Thread hook = new Thread(() -> {
             if (proc.isAlive()) {
-                proc.destroy(); // panel/Ctrl-C stops Guardio → stop the child too
+                proc.destroyForcibly(); // panel/Ctrl-C stops Guardio → make sure the child dies too (no orphans)
             }
         });
         Runtime.getRuntime().addShutdownHook(hook);

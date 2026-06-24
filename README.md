@@ -25,14 +25,21 @@ One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and 
   the only true "before everything" hook (a `plugin.yml` can't guarantee it).
 - **Whole‑server scope** — the top‑level server jar + every jar under configurable roots (default `plugins` +
   `libraries`, recursive).
-- **Two detection layers** — **integrity** (SHA‑256 vs a trusted, path‑mirrored `vault/`) and **signature**
-  (malware‑specific fingerprints only, to avoid false positives on legit plugins).
+- **Three detection layers** — **integrity** (SHA‑256 vs a trusted, path‑mirrored `vault/`), **signature**
+  (malware‑specific fingerprints only, to avoid false positives), and a **threat‑intel hash feed** (a remote
+  known‑malware SHA‑256 list, fetched + cached) so a known payload is caught even when renamed.
+- **Heuristic scan (report‑only)** — flags backdoor patterns on plugins (runtime `MethodHandles.defineClass`,
+  remote class loading, `Runtime.exec`); it **reports/alerts only**, never auto‑quarantines (no false‑positive damage).
 - **Map‑then‑load** — a new clean jar is *mapped* into the vault as its baseline; a mapped jar that changed is
   quarantined and the safe copy is restored. An infected jar that can't be removed (the running server jar)
   makes the agent **refuse to start**.
-- **Auto‑heal** — when an infected plugin has no vault copy, it downloads a **clean** replacement from a free
-  source (Modrinth, or a `sources.yml` override), **verified twice** (source SHA‑512 + a re‑scan) before use.
-  Premium/private plugins can't be auto‑fetched and are flagged for manual reinstall.
+- **Auto‑heal** — when an infected plugin has no vault copy, it restores a clean copy from `guardio/trusted/`
+  (your own backups, e.g. premium plugins) or downloads one from a free source (Modrinth / `sources.yml`),
+  **verified twice** (source SHA‑512 + a re‑scan) before use.
+- **Discord alerts** — set `discord-webhook` and Guardio pings you on every quarantine / restore / heal /
+  suspicion, from both the pre‑boot launcher and the in‑server plugin.
+- **Clean plugin reload** — `/guardio reload <plugin>` force‑tears‑down the plugin's listeners, tasks, commands,
+  services and channels (so it can't double‑register / "fire twice"), then unloads + reloads it quietly.
 
 ## Layout
 Guardio owns a clean, self-contained tree:
@@ -68,13 +75,14 @@ java -Xmx4G -javaagent:guardio-v1.0.0.jar -jar guardio/serverjar/<server>.jar no
 
 After the first clean boot the vault baseline is set (auto‑map handles new clean jars; `/guard trust all` forces it).
 
-## Commands (`guardio.admin` / op)
-- `/guard scan` — rescan now + report
-- `/guard status` — vault size, last scan, staged fixes
-- `/guard trust [all|<jar>]` — (re)map clean jar(s) as the trusted baseline
-- `/guard restore <jar>` — restore a jar from the vault
-- `/guard allow <jar>` — whitelist a false positive
-- `/guard heal` — download clean replacements for quarantined plugins
+## Commands (`/guardio`, alias `/guard`; perm `guardio.admin` / op)
+- `/guardio scan` — rescan now + report
+- `/guardio status` — vault size, last scan, staged fixes
+- `/guardio trust [all|<jar>]` — (re)map clean jar(s) as the trusted baseline
+- `/guardio restore <jar>` — restore a jar from the vault
+- `/guardio allow <jar>` — whitelist a false positive
+- `/guardio heal` — restore/download clean replacements for quarantined plugins
+- `/guardio reload <plugin>` — clean reload (forced teardown, no double‑registration; warns about dependents)
 
 ## Config
 `guardio/guardio.properties` (launcher, auto‑created) — `server-jar` (path under `guardio/serverjar/`),

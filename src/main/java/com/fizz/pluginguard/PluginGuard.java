@@ -110,8 +110,8 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
 
     @Override
     public void onEnable() {
-        if (getCommand("guard") != null) {
-            getCommand("guard").setExecutor(this);
+        if (getCommand("guardio") != null) {
+            getCommand("guardio").setExecutor(this);
         }
         int infected = count(ScanResult.Verdict.INFECTED);
         getLogger().info("Active. Vault baseline: " + vault.size() + " jar(s). Last scan: "
@@ -496,7 +496,22 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                         + "Watch console / heal-report.txt; restart when done.");
                 Bukkit.getScheduler().runTaskAsynchronously(this, () -> heal(sender));
             }
-            default -> reply(sender, "&7/guard &f<scan | status | trust [all|<jar>] | restore <jar> | allow <jar> | heal>");
+            case "reload" -> {
+                if (args.length < 2) {
+                    reply(sender, "&cUsage: /guardio reload <pluginName>  &7(clean reload — no double-registration)");
+                    return true;
+                }
+                Reloader.Result res = Reloader.reload(this, args[1]);
+                for (String line : res.lines()) {
+                    reply(sender, (res.ok() ? "&7- &f" : "&e- ") + line);
+                }
+                reply(sender, res.ok() ? "&aReloaded &f" + args[1] + "&a cleanly."
+                        : "&cReload of &f" + args[1] + "&c did not complete — see above.");
+                notify("reload", List.of((res.ok() ? "🔄 reloaded `" : "⚠️ reload FAILED for `") + args[1]
+                        + "` by " + sender.getName()));
+            }
+            default -> reply(sender, "&7/guardio &f<scan | status | trust [all|<jar>] | restore <jar> "
+                    + "| allow <jar> | heal | reload <plugin>>");
         }
         return true;
     }
