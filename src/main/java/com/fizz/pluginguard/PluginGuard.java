@@ -22,27 +22,34 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Guardio (plugin layer) — integrity guard for the whole server tree: the server jar plus every jar under the
- * configured roots. Layers: integrity (SHA-256 vs the trusted, path-mirrored vault), signature (malware
- * fingerprints), a known-malware hash feed, and report-only heuristics. The launcher/agent guard before load;
- * as a plugin, jars are locked at runtime so swaps are staged for a JVM shutdown hook.
+ * Guardio (plugin layer) — runtime integrity guard + control plane. Scans run on a single dedicated executor
+ * (off the main thread, never overlapping) with an incremental SHA-256 cache; detection spans integrity,
+ * signature, threat-feed, heuristic, cracked-plugin, and honeypot layers. A real-time {@link FileWatcher}
+ * triggers re-scans, and an HTML report is written each scan. Locked-jar swaps are staged for a shutdown hook.
  */
 public final class PluginGuard extends JavaPlugin implements CommandExecutor, TabCompleter {
 
     private static final List<String> SUBS =
-            List.of("scan", "status", "trust", "restore", "allow", "heal", "reload", "version");
+            List.of("scan", "status", "version", "doctor", "report", "trust", "restore", "allow", "heal", "reload");
 
     private record Pending(File infected, String rel, File clean, File quarantineDir) {
     }
@@ -62,6 +69,10 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     private boolean alertOps;
     private boolean shutdownOnInfection;
     private boolean heuristicsOn;
+    private boolean detectCracked;
+    private boolean honeypotOn;
+    private boolean allowlistOnly;
+    private boolean realTimeWatch;
     private Healer healer;
     private Map<String, String> sources;
     private String gameVersion;
@@ -76,9 +87,14 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
 
     private String updateStatus = "(checking)";
 
-    private final List<Pending> pending = new ArrayList<>();
-    private List<ScanResult> lastResults = new ArrayList<>();
+    private final List<Pending> pending = Collections.synchronizedList(new ArrayList<>());
+    private volatile List<ScanResult> lastResults = new ArrayList<>();
     private boolean infectionAtBoot = false;
+
+    private ExecutorService scanExecutor;
+    private final Map<String, String> shaCache = new HashMap<>(); // path|mtime|size -> sha (executor-thread only)
+    private Map<String, String> prevSnapshot = new HashMap<>();    // rel -> sha, from the previous scan
+    private FileWatcher watcher;
 
     @Override
     public void onLoad() {
@@ -104,6 +120,10 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         this.alertOps = c.getBoolean("general.alert-ops", true);
         this.shutdownOnInfection = c.getBoolean("response.shutdown-on-infection", false);
         this.heuristicsOn = c.getBoolean("scanning.heuristics", true);
+        this.detectCracked = c.getBoolean("scanning.detect-cracked", true);
+        this.honeypotOn = c.getBoolean("scanning.honeypot", true);
+        this.allowlistOnly = c.getBoolean("response.allowlist-only", false);
+        this.realTimeWatch = c.getBoolean("scanning.real-time-watch", true);
         copyResourceIfMissing("sources.yml", new File(home, "sources.yml"));
         this.healer = new Healer(scanner);
         this.sources = loadSources();
@@ -115,15 +135,25 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
 
         this.discordEnabled = c.getBoolean("discord.enabled", false);
         String wh = c.getString("discord.webhook", "");
-        this.webhook = (wh == null || wh.isBlank()) ? launcherWebhook() : wh.trim(); // fall back to guardio.properties
+        this.webhook = (wh == null || wh.isBlank()) ? launcherWebhook() : wh.trim();
         this.discordRole = c.getString("discord.mention-role-id", "");
         this.discordEmbeds = c.getBoolean("discord.embeds", true);
+
+        this.scanExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "Guardio-scan");
+            t.setDaemon(true);
+            return t;
+        });
+        this.prevSnapshot = loadSnapshot();
+        if (honeypotOn) {
+            Honeypot.deploy(serverRoot, home);
+        }
 
         Runtime.getRuntime().addShutdownHook(new Thread(this::applyPending, "Guardio-remediate"));
 
         if (c.getBoolean("general.scan-on-load", true)) {
             getLogger().info("Scanning the server (plugins + libraries + server jar) for tampering/infection...");
-            lastResults = runScan(true);
+            lastResults = runScan(true); // synchronous at load — scheduler/executor consumers not yet active
         }
     }
 
@@ -152,7 +182,12 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         int mins = config.getInt("general.periodic-scan-minutes", 0);
         if (mins > 0) {
             long ticks = mins * 60L * 20L;
-            Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> lastResults = runScan(true), ticks, ticks);
+            Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> submitScan(null), ticks, ticks);
+        }
+        if (realTimeWatch) {
+            watcher = new FileWatcher(watchDirs(), () -> submitScan(null));
+            watcher.start();
+            getLogger().info("Real-time watcher active on: " + roots);
         }
         if (config.getBoolean("general.update-check", true)) {
             Bukkit.getScheduler().runTaskAsynchronously(this, this::checkUpdate);
@@ -163,13 +198,23 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         }
     }
 
+    @Override
+    public void onDisable() {
+        if (watcher != null) {
+            watcher.stop();
+        }
+        if (scanExecutor != null) {
+            scanExecutor.shutdownNow();
+        }
+    }
+
     // ---- Config -------------------------------------------------------------
 
     private FileConfiguration loadConfigWithMigration() {
         File cfgFile = new File(home, "config.yml");
         copyResourceIfMissing("config.yml", cfgFile);
         FileConfiguration c = YamlConfiguration.loadConfiguration(cfgFile);
-        if (c.getInt("config-version", 1) < 2) { // upgrade an old (flat/Bulgarian) config
+        if (c.getInt("config-version", 1) < 2) {
             try {
                 Files.move(cfgFile.toPath(), new File(home, "config.yml.old").toPath(), StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException ignored) {
@@ -215,7 +260,6 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         }
     }
 
-    /** The launcher's webhook (guardio.properties) — so the plugin inherits it when discord.webhook is blank. */
     private String launcherWebhook() {
         File f = new File(home, "guardio.properties");
         if (f.isFile()) {
@@ -230,14 +274,57 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         return "";
     }
 
+    private List<File> watchDirs() {
+        List<File> dirs = new ArrayList<>();
+        for (String r : roots) {
+            File d = new File(serverRoot, r);
+            if (d.isDirectory()) {
+                dirs.add(d);
+            }
+        }
+        return dirs;
+    }
+
     // ---- Scanning -----------------------------------------------------------
+
+    /** Submits a scan to the single-thread executor (never overlapping); optional main-thread callback. */
+    private void submitScan(Consumer<List<ScanResult>> done) {
+        if (scanExecutor == null || scanExecutor.isShutdown()) {
+            return;
+        }
+        scanExecutor.submit(() -> {
+            List<ScanResult> r = runScan(true);
+            lastResults = r;
+            if (done != null && isEnabled()) {
+                Bukkit.getScheduler().runTask(this, () -> done.accept(r));
+            }
+        });
+    }
+
+    /** SHA-256 with an incremental cache keyed by path+mtime+size, so unchanged jars aren't re-hashed. */
+    private String cachedSha(File f) {
+        String key = f.getPath() + "|" + f.lastModified() + "|" + f.length();
+        String cached = shaCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        String sha = Hashing.sha256(f);
+        if (sha != null) {
+            shaCache.put(key, sha);
+        }
+        return sha;
+    }
 
     private List<ScanResult> runScan(boolean remediate) {
         List<ScanResult> results = new ArrayList<>();
         List<String> events = new ArrayList<>();
+        Map<String, String> snapshot = new LinkedHashMap<>();
         for (File jar : Roots.listJars(serverRoot, roots, home)) {
             String rel = Vault.rel(serverRoot, jar);
-            String sha = Hashing.sha256(jar);
+            String sha = cachedSha(jar);
+            if (sha != null) {
+                snapshot.put(rel, sha);
+            }
             List<String> sigReasons = scanner.scan(jar);
             boolean feedHit = threatFeed != null && threatFeed.contains(sha);
             List<String> reasons = new ArrayList<>(sigReasons);
@@ -247,6 +334,12 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
             boolean sigHit = feedHit || (!sigReasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist));
             boolean inVault = vault.has(rel);
             boolean hashMatch = inVault && sha != null && sha.equals(vault.hash(rel));
+            boolean isPlugin = rel.startsWith("plugins");
+
+            // Allowlist-only: a NEW plugin that isn't mapped/whitelisted is refused (not auto-mapped).
+            boolean allowlistBlock = allowlistOnly && isPlugin && !inVault && !sigHit
+                    && !Whitelist.allows(jar.getName(), whitelist);
+
             ScanResult r = new ScanResult(jar, sha, sigHit, inVault, hashMatch, reasons);
             results.add(r);
 
@@ -260,24 +353,121 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
                 if (remediate && autoQuarantine) {
                     stageRemediation(jar, rel);
                 }
+            } else if (allowlistBlock) {
+                getLogger().severe("NOT ON ALLOWLIST (allowlist-only mode): " + rel);
+                if (discordAlert("quarantine")) {
+                    events.add(msg.plain("discord.infected", "rel", rel, "reason", "not on allowlist (allowlist-only mode)"));
+                }
+                if (remediate && autoQuarantine) {
+                    stageRemediation(jar, rel);
+                }
             } else if (r.verdict() == ScanResult.Verdict.UNVERIFIED && autoMap && remediate) {
                 if (vault.trust(jar, rel)) {
                     getLogger().info("mapped new jar into vault baseline: " + rel);
                 }
-                if (heuristicsOn && rel.startsWith("plugins")) {
-                    List<String> sus = Heuristics.analyze(jar);
-                    if (!sus.isEmpty()) {
-                        getLogger().warning("SUSPICIOUS (report-only, NOT quarantined): " + rel + "  ->  " + String.join("; ", sus));
-                        if (discordAlert("suspicious")) {
-                            events.add(msg.plain("discord.suspicious", "rel", rel, "reason", String.join("; ", sus)));
-                        }
-                    }
+                if (isPlugin) {
+                    reportOnly(rel, jar, events);
                 }
             }
         }
-        writeReport(results);
+        Honeypot.check(serverRoot, home).forEach(trip -> {
+            getLogger().severe("HONEYPOT: " + trip);
+            if (discordAlert("suspicious")) {
+                events.add("🪤 " + trip);
+            }
+        });
+        changeReport(snapshot, events);
+        saveSnapshot(snapshot);
+        prevSnapshot = snapshot;
+        writeReports(results);
         notify("scan", events);
         return results;
+    }
+
+    /** Report-only layers (heuristics + cracked-plugin), never auto-quarantine. */
+    private void reportOnly(String rel, File jar, List<String> events) {
+        List<String> flags = new ArrayList<>();
+        if (heuristicsOn) {
+            flags.addAll(Heuristics.analyze(jar));
+        }
+        if (detectCracked) {
+            flags.addAll(CrackedPluginDetector.analyze(jar));
+        }
+        if (!flags.isEmpty()) {
+            getLogger().warning("SUSPICIOUS (report-only, NOT quarantined): " + rel + "  ->  " + String.join("; ", flags));
+            if (discordAlert("suspicious")) {
+                events.add(msg.plain("discord.suspicious", "rel", rel, "reason", String.join("; ", flags)));
+            }
+        }
+    }
+
+    private void changeReport(Map<String, String> current, List<String> events) {
+        if (prevSnapshot.isEmpty()) {
+            return; // first run — nothing to diff against
+        }
+        List<String> added = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
+        for (Map.Entry<String, String> e : current.entrySet()) {
+            String old = prevSnapshot.get(e.getKey());
+            if (old == null) {
+                added.add(e.getKey());
+            } else if (!old.equals(e.getValue())) {
+                changed.add(e.getKey());
+            }
+        }
+        for (String k : prevSnapshot.keySet()) {
+            if (!current.containsKey(k)) {
+                removed.add(k);
+            }
+        }
+        if (added.isEmpty() && removed.isEmpty() && changed.isEmpty()) {
+            return;
+        }
+        getLogger().info("changes since last scan: +" + added.size() + " new, ~" + changed.size()
+                + " changed, -" + removed.size() + " removed.");
+        for (String a : added) {
+            getLogger().info("  + " + a);
+        }
+        for (String ch : changed) {
+            getLogger().info("  ~ " + ch);
+        }
+        for (String rm : removed) {
+            getLogger().info("  - " + rm);
+        }
+        if (discordEnabled) {
+            events.add(msg.plain("discord.changes", "added", added.size(), "changed", changed.size(), "removed", removed.size()));
+        }
+    }
+
+    private Map<String, String> loadSnapshot() {
+        Map<String, String> m = new HashMap<>();
+        File f = new File(home, "snapshot.txt");
+        if (f.isFile()) {
+            try {
+                for (String line : Files.readAllLines(f.toPath())) {
+                    int tab = line.indexOf('\t');
+                    if (tab > 0) {
+                        m.put(line.substring(0, tab), line.substring(tab + 1).trim());
+                    }
+                }
+            } catch (IOException ignored) {
+                // none
+            }
+        }
+        return m;
+    }
+
+    private void saveSnapshot(Map<String, String> snapshot) {
+        List<String> lines = new ArrayList<>(snapshot.size());
+        for (Map.Entry<String, String> e : snapshot.entrySet()) {
+            lines.add(e.getKey() + "\t" + e.getValue());
+        }
+        try {
+            Files.write(new File(home, "snapshot.txt").toPath(), lines);
+        } catch (IOException ignored) {
+            // non-fatal
+        }
     }
 
     private void stageRemediation(File jar, String rel) {
@@ -289,11 +479,15 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     }
 
     private void applyPending() {
-        if (pending.isEmpty()) {
-            return;
+        List<Pending> copy;
+        synchronized (pending) {
+            if (pending.isEmpty()) {
+                return;
+            }
+            copy = new ArrayList<>(pending);
         }
         List<String> log = new ArrayList<>();
-        for (Pending p : pending) {
+        for (Pending p : copy) {
             try {
                 if (p.infected().exists()) {
                     File q = new File(p.quarantineDir(), p.rel() + "." + System.currentTimeMillis() + ".infected");
@@ -458,6 +652,33 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         return m;
     }
 
+    // ---- Reporting ----------------------------------------------------------
+
+    private void writeReports(List<ScanResult> results) {
+        List<String> lines = new ArrayList<>();
+        lines.add("Guardio scan report");
+        lines.add("vault baseline jars: " + vault.size());
+        lines.add("");
+        for (ScanResult r : results) {
+            lines.add(r.verdict() + "  " + Vault.rel(serverRoot, r.jar())
+                    + (r.verdict() == ScanResult.Verdict.INFECTED
+                        ? "  :: " + (r.signatureHit() ? String.join("; ", r.reasons()) : "hash mismatch vs vault")
+                        : ""));
+        }
+        try {
+            Files.write(new File(home, "guard-report.txt").toPath(), lines);
+        } catch (IOException ignored) {
+            // non-fatal
+        }
+        try {
+            String stamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss z").format(new Date());
+            ReportExporter.write(new File(home, "report.html"),
+                    ReportExporter.html(serverName, stamp, vault.size(), serverRoot, results));
+        } catch (IOException ignored) {
+            // non-fatal
+        }
+    }
+
     // ---- Discord ------------------------------------------------------------
 
     private boolean discordAlert(String type) {
@@ -485,7 +706,8 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     // ---- Update check -------------------------------------------------------
 
     private void checkUpdate() {
-        String latest = UpdateChecker.latest(config.getString("general.update-url", "https://api.github.com/repos/fizzexual/Guardio/releases/latest"));
+        String latest = UpdateChecker.latest(config.getString("general.update-url",
+                "https://api.github.com/repos/fizzexual/Guardio/releases/latest"));
         if (latest == null) {
             updateStatus = msg.get("update.unknown");
         } else if (!latest.equalsIgnoreCase(version())) {
@@ -503,18 +725,20 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         String sub = args.length > 0 ? args[0].toLowerCase(Locale.ROOT) : "status";
         switch (sub) {
             case "scan" -> {
-                lastResults = runScan(true);
-                send(sender, msg.get("scan.complete", "total", lastResults.size(),
-                        "infected", count(ScanResult.Verdict.INFECTED), "unverified", count(ScanResult.Verdict.UNVERIFIED)));
-                for (ScanResult r : lastResults) {
-                    if (r.verdict() == ScanResult.Verdict.INFECTED) {
-                        sendRaw(sender, msg.get("scan.infected-line", "rel", Vault.rel(serverRoot, r.jar()),
-                                "reason", r.signatureHit() ? String.join("; ", r.reasons()) : "hash mismatch vs vault"));
+                send(sender, msg.get("scan.started"));
+                submitScan(r -> {
+                    send(sender, msg.get("scan.complete", "total", r.size(),
+                            "infected", count(r, ScanResult.Verdict.INFECTED), "unverified", count(r, ScanResult.Verdict.UNVERIFIED)));
+                    for (ScanResult x : r) {
+                        if (x.verdict() == ScanResult.Verdict.INFECTED) {
+                            sendRaw(sender, msg.get("scan.infected-line", "rel", Vault.rel(serverRoot, x.jar()),
+                                    "reason", x.signatureHit() ? String.join("; ", x.reasons()) : "hash mismatch vs vault"));
+                        }
                     }
-                }
-                if (!pending.isEmpty()) {
-                    send(sender, msg.get("scan.staged", "count", pending.size()));
-                }
+                    if (!pending.isEmpty()) {
+                        send(sender, msg.get("scan.staged", "count", pending.size()));
+                    }
+                });
             }
             case "status" -> send(sender, msg.get("status", "vault", vault.size(), "total", lastResults.size(),
                     "infected", count(ScanResult.Verdict.INFECTED), "unverified", count(ScanResult.Verdict.UNVERIFIED),
@@ -524,6 +748,11 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
                         "launcher", launcherActive(), "agent", agentActive(), "update", updateStatus)) {
                     sendRaw(sender, line);
                 }
+            }
+            case "doctor" -> doctor(sender);
+            case "report" -> {
+                writeReports(lastResults);
+                send(sender, msg.get("report.written", "path", "guardio/report.html"));
             }
             case "trust" -> {
                 if (args.length < 2) {
@@ -582,6 +811,23 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
             default -> send(sender, msg.get("command.unknown"));
         }
         return true;
+    }
+
+    private void doctor(CommandSender s) {
+        send(s, msg.get("doctor.header"));
+        line(s, System.getProperty("guardio.launcher") != null, "Launcher active (server-jar healing on)");
+        line(s, System.getProperty("guardio.agent") != null, "Pre-load agent active");
+        line(s, vault.size() > 0, "Vault baseline set (" + vault.size() + " jars)");
+        line(s, config.getInt("config-version", 1) >= 2, "Config up to date (v" + config.getInt("config-version", 1) + ")");
+        line(s, home.canWrite(), "guardio/ is writable");
+        line(s, threatFeed != null, "Threat feed loaded (" + (threatFeed != null ? threatFeed.size() : 0) + " hashes)");
+        line(s, !discordEnabled || (webhook != null && !webhook.isBlank()), "Discord webhook set (or disabled)");
+        line(s, count(ScanResult.Verdict.INFECTED) == 0, "No infected jars in last scan");
+        line(s, pending.isEmpty(), "No fixes pending restart");
+    }
+
+    private void line(CommandSender s, boolean ok, String label) {
+        sendRaw(s, msg.get(ok ? "doctor.pass" : "doctor.fail", "label", label));
     }
 
     @Override
@@ -657,8 +903,12 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     }
 
     private int count(ScanResult.Verdict v) {
+        return count(lastResults, v);
+    }
+
+    private int count(List<ScanResult> results, ScanResult.Verdict v) {
         int n = 0;
-        for (ScanResult r : lastResults) {
+        for (ScanResult r : results) {
             if (r.verdict() == v) {
                 n++;
             }
@@ -679,10 +929,10 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     }
 
     private void alertOps(String colored) {
-        String line = msg.prefix() + colored;
+        String l = msg.prefix() + colored;
         for (Player p : Bukkit.getOnlinePlayers()) {
             if (p.isOp()) {
-                p.sendMessage(line);
+                p.sendMessage(l);
             }
         }
     }
@@ -693,23 +943,5 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
 
     private void sendRaw(CommandSender sender, String colored) {
         sender.sendMessage(colored);
-    }
-
-    private void writeReport(List<ScanResult> results) {
-        List<String> lines = new ArrayList<>();
-        lines.add("Guardio scan report");
-        lines.add("vault baseline jars: " + vault.size());
-        lines.add("");
-        for (ScanResult r : results) {
-            lines.add(r.verdict() + "  " + Vault.rel(serverRoot, r.jar())
-                    + (r.verdict() == ScanResult.Verdict.INFECTED
-                        ? "  :: " + (r.signatureHit() ? String.join("; ", r.reasons()) : "hash mismatch vs vault")
-                        : ""));
-        }
-        try {
-            Files.write(new File(home, "guard-report.txt").toPath(), lines);
-        } catch (IOException ignored) {
-            // non-fatal
-        }
     }
 }

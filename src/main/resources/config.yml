@@ -25,6 +25,12 @@ scanning:
     - "libraries"
   # Report-only behavioural analysis (flags backdoor patterns; never auto-quarantines).
   heuristics: true
+  # Report-only cracked/nulled-plugin detection (the #1 infection vector). Never auto-quarantines.
+  detect-cracked: true
+  # Drop canary/honeypot files and alert if anything tampers with them.
+  honeypot: true
+  # Real-time watcher: re-scan instantly when a jar appears or changes (debounced).
+  real-time-watch: true
 
 response:
   # Move infected jars into guardio/quarantine/.
@@ -35,6 +41,8 @@ response:
   auto-map: true
   # Stop the server if infection is found at boot (off by default).
   shutdown-on-infection: false
+  # Allowlist-only: refuse (quarantine) any NEW plugin that isn't already trusted/whitelisted. Strict mode.
+  allowlist-only: false
 
 heal:
   # Download a clean replacement (free sources + guardio/trusted/ backups) for an infected plugin with no vault copy.

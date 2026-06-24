@@ -11,9 +11,18 @@ command:
   unknown: "&7/guardio &f<scan | status | trust [all|<jar>] | restore <jar> | allow <jar> | heal | reload <plugin> | version>"
 
 scan:
+  started: "&7Scanning… (running off the main thread)"
   complete: "&aScan complete: &f{total}&a jar(s), &c{infected}&a infected, &e{unverified}&a unverified."
   infected-line: "  &cINFECTED &f{rel} &7- {reason}"
   staged: "&e{count}&7 fix(es) staged — restart to apply."
+
+report:
+  written: "&aSecurity report written to &f{path}&a."
+
+doctor:
+  header: "&b&lGuardio doctor &7— health check:"
+  pass: "  &a✔ &f{label}"
+  fail: "  &c✘ &f{label}"
 
 status: "&7Vault: &f{vault}&7 jars &8| &7last scan &f{total}&7 (&c{infected}&7 infected, &e{unverified}&7 unverified) &8| &e{staged}&7 staged for restart."
 
@@ -67,3 +76,4 @@ discord:
   heal: "✅ healed `{rel}`  <-  {source}"
   suspicious: "⚠️ suspicious (report-only) `{rel}` :: {reason}"
   infected: "🛑 INFECTED `{rel}` :: {reason}"
+  changes: "📋 changes since last scan: +{added} new, ~{changed} changed, -{removed} removed"
