@@ -65,7 +65,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     public void onLoad() {
         saveDefaultConfig();
         FileConfiguration c = getConfig();
-        this.serverRoot = getDataFolder().getParentFile().getParentFile(); // <root>/plugins/PluginGuard -> <root>
+        this.serverRoot = resolveServerRoot(); // robust: Paper's plugin remapper can leave getDataFolder()'s parents null
         this.vault = new Vault(getDataFolder());
         this.scanner = new JarScanner(c.getStringList("entry-signatures"), c.getStringList("content-signatures"));
         this.roots = c.getStringList("scan-roots").isEmpty() ? Roots.DEFAULTS : c.getStringList("scan-roots");
@@ -129,6 +129,24 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     }
 
     // ---- Scanning -------------------------------------------------------
+
+    /** Server root, resolved robustly. Paper's plugin remapper can load us in a pass where getDataFolder()'s
+     *  parent chain is null, so prefer the server's working directory and fall back safely (never null). */
+    private File resolveServerRoot() {
+        try {
+            File wc = getServer().getWorldContainer();
+            if (wc != null) {
+                return wc.getCanonicalFile();
+            }
+        } catch (Throwable ignored) {
+            // server not ready / unavailable — fall through
+        }
+        File df = getDataFolder();
+        if (df != null && df.getParentFile() != null && df.getParentFile().getParentFile() != null) {
+            return df.getParentFile().getParentFile();
+        }
+        return new File(".").getAbsoluteFile();
+    }
 
     private List<ScanResult> runScan(boolean remediate) {
         List<ScanResult> results = new ArrayList<>();

@@ -2,6 +2,9 @@
 target/
 *.class
 
+# Local test server (downloaded Purpur + generated world; not part of the project)
+test-server/
+
 # IDE / editor
 .idea/
 *.iml

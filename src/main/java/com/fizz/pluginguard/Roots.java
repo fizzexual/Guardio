@@ -40,6 +40,9 @@ final class Roots {
         if (canon(d).startsWith(guardPath)) {
             return; // never descend into our own vault/quarantine
         }
+        if (d.getName().equalsIgnoreCase(".paper-remapped")) {
+            return; // Paper/Purpur internal remap cache — remapped duplicates, not real plugins
+        }
         File[] fs = d.listFiles();
         if (fs == null) {
             return;

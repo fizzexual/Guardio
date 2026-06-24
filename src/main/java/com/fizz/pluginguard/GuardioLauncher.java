@@ -237,12 +237,30 @@ public final class GuardioLauncher {
         boolean restartOnCrash = Boolean.parseBoolean(cfg.get("restart-on-crash", "false"));
         String restartFlag = cfg.get("restart-flag", "");
         List<String> serverArgs = forwardServerArgs(mainArgs, cfg);
+        String mainClass = readMainClass(realJar);
 
-        boolean subprocess = mode.equals("subprocess");
+        // How to run the server. Real server bootstraps (paperclip/craftbukkit/bundler/fabric) assume they ARE
+        // the main jar on the system classpath, so they can't be hosted in-process via a child classloader -
+        // they must run as their own process. Detect those and use a subprocess even in auto mode.
+        boolean subprocess;
+        if (mode.equals("subprocess")) {
+            subprocess = true;
+        } else if (needsSubprocess(mainClass)) {
+            if (mode.equals("in-process")) {
+                logRed("launch-mode=in-process, but '" + mainClass + "' is a server bootstrap that must run as "
+                        + "its own process - using a subprocess so the server actually starts.");
+            } else {
+                banner("'" + mainClass + "' is a server bootstrap - running it as a subprocess (host flags forwarded).");
+            }
+            subprocess = true;
+        } else {
+            subprocess = false; // exotic / blocking main — safe to try in-process
+        }
+
         while (true) {
             int code;
             if (!subprocess) {
-                boolean ran = launchInProcess(realJar, serverArgs);
+                boolean ran = launchInProcess(realJar, mainClass, serverArgs);
                 if (!ran) {
                     if (mode.equals("in-process")) {
                         logRed("in-process launch failed and fallback is disabled (launch-mode=in-process).");
@@ -269,18 +287,35 @@ public final class GuardioLauncher {
         }
     }
 
+    private static String readMainClass(File jar) {
+        try (JarFile jf = new JarFile(jar)) {
+            return jf.getManifest() == null ? null : jf.getManifest().getMainAttributes().getValue("Main-Class");
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /** True for server bootstraps that must run as their own process (can't be hosted in-process). */
+    private static boolean needsSubprocess(String mc) {
+        if (mc == null) {
+            return true; // unknown — be safe, use a subprocess
+        }
+        String low = mc.toLowerCase(Locale.ROOT);
+        return mc.equals("io.papermc.paperclip.Main")       // Paper / Purpur / Folia (paperclip)
+                || mc.startsWith("org.bukkit.craftbukkit.")  // Spigot / CraftBukkit bootstrap + Main
+                || mc.equals("net.minecraft.bundler.Main")   // vanilla bundler
+                || low.contains("fabric")                    // Fabric launchers
+                || low.contains("bootstrap")                 // generic bootstrap launchers
+                || low.contains("launchwrapper");            // legacy / Forge launchwrapper
+    }
+
     /** Loads the real server jar in THIS JVM and runs its Main-Class. Returns false if it failed to launch. */
-    private static boolean launchInProcess(File realJar, List<String> serverArgs) {
+    private static boolean launchInProcess(File realJar, String mainClass, List<String> serverArgs) {
+        if (mainClass == null) {
+            logRed("the server jar has no Main-Class - can't launch in-process.");
+            return false;
+        }
         try {
-            String mainClass;
-            try (JarFile jf = new JarFile(realJar)) {
-                mainClass = jf.getManifest() == null ? null
-                        : jf.getManifest().getMainAttributes().getValue("Main-Class");
-            }
-            if (mainClass == null) {
-                logRed("the server jar has no Main-Class - can't launch in-process.");
-                return false;
-            }
             banner("launching server in-process (" + mainClass + ", same JVM, no extra RAM)...");
             URLClassLoader cl = new URLClassLoader(new URL[]{realJar.toURI().toURL()}, ClassLoader.getSystemClassLoader());
             Thread.currentThread().setContextClassLoader(cl);
@@ -446,7 +481,7 @@ public final class GuardioLauncher {
             String ver = (jar == null) ? "" : jar.replaceAll("(?i).*?(\\d+\\.\\d+(?:\\.\\d+)?).*", "$1");
             String url = "";
             if (jar != null && jar.toLowerCase(Locale.ROOT).contains("purpur") && !ver.equals(jar)) {
-                url = "https://api.purpur.org/v2/purpur/" + ver + "/latest/download";
+                url = "https://api.purpurmc.org/v2/purpur/" + ver + "/latest/download";
             }
             p.setProperty("server-jar", jar == null ? "" : jar);
             p.setProperty("server-jar-url", url);
