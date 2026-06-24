@@ -1,109 +1,160 @@
-# Guardio (PluginGuard)
+# Guardio
 
-A whole‑server integrity guard / anti‑tamper plugin for Paper/Purpur (1.21). One jar that detects, quarantines,
-and **auto‑heals** infected/tampered server jars — built after a self‑spreading plugin‑jar infector
-(`pluginstatstrack` C2, shaded `javassist/orgs` + `javassist/ws`, a `…L10` loader) hit a real server.
+**A multi‑context integrity‑enforcement and malware‑remediation engine for Paper‑family Minecraft servers (1.21+).**
+Guardio operates as a single self‑contained artifact exposing **three JVM entry points** — a process‑supervising
+**launcher** (`Main-Class`), a pre‑load **instrumentation agent** (`Premain-Class`/`Agent-Class`), and an
+in‑process **Bukkit plugin** — and applies a **four‑layer detection pipeline** over a **content‑addressable,
+path‑mirrored trust store** to detect, quarantine, restore, and autonomously re‑provision tampered or
+weaponized JAR artifacts across the entire server tree.
 
-> **It guards a clean baseline.** It is **not** a cure for an already‑compromised *host* — OS‑level
-> persistence, stolen credentials, or a trojaned OS/server are outside any plugin's reach. Clean the host and
-> rotate credentials too.
+---
 
-One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and **plugin** (in `plugins/`).
+## 1. Threat model
 
-## What it does
-- **Launcher** (`java -jar guardio-v1.0.0.jar`) — the strongest mode, and **host‑agnostic**: make Guardio the jar your
-  host launches and it runs *before* the server, so it can clean and **heal the whole tree including the server
-  jar itself** (download a clean copy from the official Purpur/Paper URL when it's infected, modified, or
-  missing), then runs the real server. It **forwards the host's own JVM flags + program args** (heap, GC,
-  `nogui`, …) and passes the console/stop through, so it drops into any panel (Pterodactyl, Multicraft, …) or
-  start script unchanged. Two ways to run the server (`launch-mode`): **in‑process** (same JVM — zero extra RAM,
-  one process; best for memory‑capped panels) with automatic fallback to a **subprocess** (separate JVM —
-  rock‑solid for any server software) if the server doesn't cooperate. Because it runs before any plugin, the
-  infector never executes during a guarded boot, so it can't tamper with Guardio mid‑run; it self‑hash‑checks
-  each start.
-- **Pre‑load agent** (`-javaagent`) — runs in `premain`, before any plugin loads, so jars are unlocked. This is
-  the only true "before everything" hook (a `plugin.yml` can't guarantee it).
-- **Whole‑server scope** — the top‑level server jar + every jar under configurable roots (default `plugins` +
-  `libraries`, recursive).
-- **Three detection layers** — **integrity** (SHA‑256 vs a trusted, path‑mirrored `vault/`), **signature**
-  (malware‑specific fingerprints only, to avoid false positives), and a **threat‑intel hash feed** (a remote
-  known‑malware SHA‑256 list, fetched + cached) so a known payload is caught even when renamed.
-- **Heuristic scan (report‑only)** — flags backdoor patterns on plugins (runtime `MethodHandles.defineClass`,
-  remote class loading, `Runtime.exec`); it **reports/alerts only**, never auto‑quarantines (no false‑positive damage).
-- **Map‑then‑load** — a new clean jar is *mapped* into the vault as its baseline; a mapped jar that changed is
-  quarantined and the safe copy is restored. An infected jar that can't be removed (the running server jar)
-  makes the agent **refuse to start**.
-- **Auto‑heal** — when an infected plugin has no vault copy, it restores a clean copy from `guardio/trusted/`
-  (your own backups, e.g. premium plugins) or downloads one from a free source (Modrinth / `sources.yml`),
-  **verified twice** (source SHA‑512 + a re‑scan) before use.
-- **Discord alerts** — set `discord-webhook` and Guardio pings you on every quarantine / restore / heal /
-  suspicion, from both the pre‑boot launcher and the in‑server plugin.
-- **Clean plugin reload** — `/guardio reload <plugin>` force‑tears‑down the plugin's listeners, tasks, commands,
-  services and channels (so it can't double‑register / "fire twice"), then unloads + reloads it quietly.
+Guardio is engineered against self‑propagating JAR‑infector malware of the **`pluginstatstrack`** class — a
+polymorphic loader observed injecting **≈154 classes per host artifact**, comprising a shaded
+`javassist/orgs/…` namespace (relocated `org.java_websocket` + `slf4j`), a `javassist/ws/…` WebSocket C2 client
+(`mc.pluginstatstrack.xyz:5050/ws`), an egress‑profiling probe (`checkip.amazonaws.com`), a runtime class
+stager built on `java.lang.invoke.MethodHandles$Lookup#defineClass`, and a manifest‑injected `…L10` bootstrap
+that re‑enters the payload on every classload. Propagation vector: trojanized loaders (`ULoader`, JNIC
+native‑obfuscated) and cracked premium artifacts. The infector is **path‑agnostic and re‑entrant**, which
+defeats single‑point AV scanning and mandates a **whole‑tree, every‑boot, pre‑execution** enforcement model.
 
-## Layout
-Guardio owns a clean, self-contained tree:
+---
+
+## 2. Execution topology
+
 ```
-<server root>/
-├── guardio-v1.0.0.jar          ← the launcher you run
-├── guardio/                    ← Guardio's home
-│   ├── serverjar/<server>.jar  ← the real server jar lives here
-│   ├── vault/  quarantine/
-│   └── guardio.properties, config.yml, sources.yml, reports
-└── plugins/  libraries/  world/  …   ← plugins/ also gets a synced Guardio copy (the in-server layer)
+                       ┌─────────────────────────── guardio-v1.0.0.jar ───────────────────────────┐
+  java -jar  ─────────▶│ (1) LAUNCHER  Main-Class            process supervisor, T0 enforcement     │
+                       │      • resolves server-root from CodeSource (cwd-independent)              │
+                       │      • whole-tree scan/heal BEFORE the server JVM exists                   │
+                       │      • server-jar re-provisioning (official upstream, SHA-verified)        │
+                       │      • forks the server, forwarding host JVM args (RuntimeMXBean)          │
+                       │              │                                                             │
+                       │              ▼  spawns child JVM  (-javaagent:self -Dguardio.launcher)     │
+                       │ (2) AGENT  premain()                T1 enforcement, pre-classload          │
+                       │      • runs before any plugin/library is loaded; jars unlocked             │
+                       │      • map-then-load reconciliation against the trust store                │
+                       │              │                                                             │
+                       │              ▼  Bukkit bootstrap                                            │
+                       │ (3) PLUGIN  onLoad/onEnable         T2 enforcement, runtime + control plane │
+                       │      • runtime re-scan, scheduler-driven periodic sweeps                   │
+                       │      • remediation staging (locked-jar swap via shutdown hook)             │
+                       │      • Modrinth/trusted re-provisioning, /guardio control surface          │
+                       └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Install
+A boot is guarded at **three temporal checkpoints** (T0 pre‑JVM, T1 pre‑classload, T2 runtime). The launcher
+selects an in‑process `URLClassLoader` re‑entry **or** a forked child JVM by introspecting the server jar's
+`Main-Class` against a bootstrap‑signature set (`io.papermc.paperclip.Main`, `org.bukkit.craftbukkit.*`,
+`net.minecraft.bundler.Main`, Fabric/launchwrapper) — paperclip‑class bootstraps are isolation‑incompatible
+with child‑classloader hosting and are therefore forked, with host `-Xmx`/GC flags forwarded verbatim.
 
-**Recommended — launcher mode** (guards the whole server, incl. the server jar):
-1. Put `guardio-v1.0.0.jar` in the server root, and your server jar in the root too (Guardio moves it into
-   `guardio/serverjar/`), or place it directly in `guardio/serverjar/`.
-2. Start it, any of:
-   - **Double-click `guardio-v1.0.0.jar`** — Guardio opens a console window and runs the server in it (nothing
-     extra is written to your folder; heap comes from `java-args` in `guardio/guardio.properties`).
-   - **Command line:** `java -Xmx4G -jar guardio-v1.0.0.jar` (put `-Xmx`/flags on the Guardio command — it forwards them).
-3. First run creates `guardio/` (config + vault), moves the server jar into `guardio/serverjar/`, drops a synced
-   plugin copy in `plugins/`, scans/heals the whole tree, then launches + supervises the server. Do the first
-   run on a **clean** install so the baseline is clean. (Guardio uses its own jar's folder as the server root,
-   so a double-click works regardless of the working directory.)
+---
 
-**On a hosting panel (Pterodactyl, Multicraft, shared hosts, …):** point the panel at `guardio-v1.0.0.jar`
-(rename it to whatever jar the panel runs — often `server.jar` — or set the panel's jar/startup field). Guardio
-finds the real server jar in `guardio/serverjar/` (auto-detecting + moving one if needed) and runs it, forwarding
-the panel's `-Xmx`/flags + console. `launch-mode=in-process` keeps it to a single process for hard memory caps.
+## 3. Detection pipeline (four layers)
 
-**Or agent‑only mode** (no launcher; guards plugins + libraries, detects the server jar but can't heal it live):
+| # | Layer | Mechanism | Authority | Cost |
+|---|-------|-----------|-----------|------|
+| L1 | **Integrity** | SHA‑256 of each artifact vs the path‑keyed trust‑store baseline | deterministic | O(bytes), hash‑cached |
+| L2 | **Signature (IOC)** | ZIP entry‑name fragments + ISO‑8859‑1 content‑byte scan of `.class` members (≤3 MiB/class, ≤10 reasons) | malware‑specific only | O(entries) |
+| L3 | **Threat‑intel feed** | membership test of artifact SHA‑256 against a remote, cached known‑malware hash set | **authoritative — overrides trust** | O(1) |
+| L4 | **Heuristic (report‑only)** | constant‑pool token analysis: `MethodHandles.defineClass` ∧ `{URLClassLoader│URL.openStream}` ∧ `{Runtime.exec│ProcessBuilder}`; emits on ≥2 categories or the define‑class∧remote‑fetch dyad | advisory — **never auto‑quarantines** | O(bytes), plugins‑scope only |
+
+L2 signatures are deliberately constrained to strings/paths **absent from legitimate libraries** (verified
+against a 118‑artifact Paper dependency set with a 0‑false‑positive result) to eliminate collateral
+quarantine. L3 is authoritative: a feed hash match **supersedes a prior trust mapping**, closing the
+"trusted‑then‑later‑classified" window. L4 is strictly advisory to preserve a zero‑false‑quarantine guarantee.
+
+---
+
+## 4. Trust store & reconciliation (map‑then‑load)
+
+The trust store is a **path‑mirrored, content‑verified vault** keyed by artifact path relative to server‑root.
+Reconciliation is a three‑way state machine evaluated per artifact at every checkpoint:
+
 ```
-java -Xmx4G -javaagent:guardio-v1.0.0.jar -jar guardio/serverjar/<server>.jar nogui
+UNMAPPED  ──(L2∧¬whitelist ∨ L3)──▶ QUARANTINE ──▶ re-provision (vault│trusted│Modrinth)
+UNMAPPED  ──(clean)──────────────▶ MAP (baseline)        + L4 advisory emit
+MAPPED    ──(SHA match)──────────▶ ADMIT (no-op)
+MAPPED    ──(SHA divergence)─────▶ QUARANTINE ──▶ restore vault copy
 ```
 
-After the first clean boot the vault baseline is set (auto‑map handles new clean jars; `/guard trust all` forces it).
+At T1 (agent) all targets except the running `-jar` are unlocked and swapped atomically (`Files.move`); at T2
+(plugin) live artifacts are file‑locked, so remediation is **staged and committed in a JVM shutdown hook**,
+yielding a clean *next* boot. The server jar is re‑provisioned only by the launcher (T0), where it is not yet
+the running image.
 
-## Commands (`/guardio`, alias `/guard`; perm `guardio.admin` / op)
-- `/guardio scan` — rescan now + report
-- `/guardio status` — vault size, last scan, staged fixes
-- `/guardio trust [all|<jar>]` — (re)map clean jar(s) as the trusted baseline
-- `/guardio restore <jar>` — restore a jar from the vault
-- `/guardio allow <jar>` — whitelist a false positive
-- `/guardio heal` — restore/download clean replacements for quarantined plugins
-- `/guardio reload <plugin>` — clean reload (forced teardown, no double‑registration; warns about dependents)
+---
 
-## Config
-`guardio/guardio.properties` (launcher, auto‑created) — `server-jar` (path under `guardio/serverjar/`),
-`server-jar-url`, `launch-mode` (`auto`/`in-process`/`subprocess`), `java-args`/`server-args` (fallback only —
-the host's own flags are forwarded), `use-agent`, `restart-on-crash`, `restart-flag`, `scan-roots`.
-`guardio/config.yml` (plugin) — scan roots, signatures, auto‑map/quarantine/restore/download, whitelist, shutdown‑on‑infection.
-`guardio/sources.yml` (plugin) — download overrides (`modrinth:<slug>` / `url:<jar>` / `github:<owner/repo>`).
+## 5. Autonomous re‑provisioning
 
-## Testing
-`test-harness/` builds **GuardioTester** — a 100% harmless plugin that exercises every Guardio layer. It never
-opens a connection, runs a command, or loads code; on request it writes small **inert** decoy jars into
-`plugins/`. Build it (`mvn -f test-harness/pom.xml package`), drop `GuardioTester.jar` in `plugins/`, then:
-- `/gtest signature` — decoy that trips signature detection (entry + content) → quarantined
-- `/gtest heuristic` — decoy that trips the report‑only heuristic scan → flagged, left in place
-- `/gtest feedtest` — clean jar + adds its hash to the threat feed → quarantined by hash after restart
-- `/gtest tamper` — integrity test: trust it, modify it, rescan → restored from the vault
-- `/gtest id` — verify `/guardio reload GuardioTester` doesn't double‑register
-- `/gtest clean` — delete the decoys
+Quarantined artifacts with no vault baseline are re‑provisioned through a **two‑source, dual‑verification**
+pipeline: (a) operator‑curated `guardio/trusted/` backups (premium artifacts with no free distribution), then
+(b) Modrinth API v2 resolution by loader+game‑version, with **SHA‑512 upstream verification AND a full
+re‑scan** of the candidate before installation. The server jar is re‑provisioned from the official upstream
+(Purpur/Paper distribution API). Provisioning is non‑destructive and idempotent; every installed artifact is
+re‑baselined into the vault.
 
-(Its own malware markers are stored Base64‑encoded so Guardio doesn't flag the tester itself.)
+---
+
+## 6. Clean reload subsystem
+
+`/guardio reload <plugin>` performs a **deterministic teardown** of all Bukkit‑tracked registration surfaces —
+`HandlerList` listeners, scheduler tasks, `ServicesManager` providers, plugin‑messaging channels, and the
+`CommandMap` `knownCommands` projection — **prior to** disable, eliminating the double‑registration class of
+defects endemic to naïve disable/enable cycles. Classloader disposal (`URLClassLoader#close` + back‑reference
+nulling) releases the artifact handle and admits GC. Re‑entry uses Paper's runtime loader
+(`PaperPluginManagerImpl.instanceManager#loadPlugin(Path)`) — the Bukkit‑interface `loadPlugin(File)` routes
+through provider storage and fails at runtime. Dependents are dependency‑graph‑resolved and warned;
+`paper-plugin.yml` bootstrap plugins are refused (incompatible with runtime re‑entry).
+
+---
+
+## 7. Operational characteristics
+
+- **Single artifact**, three manifest entry points; **zero runtime dependencies** beyond the JDK (Gson is
+  `provided` by the platform; the launcher/agent paths are pure JDK).
+- **Checkpoint coverage:** T0 (pre‑JVM) ∪ T1 (pre‑classload) ∪ T2 (runtime) — an artifact is evaluated up to 3×.
+- **Verified reference deployment:** Purpur 1.21.11 / JDK 21, 122–129‑artifact baseline, `Done` in 15–23 s,
+  graceful‑stop and clean‑reload validated, **0 exceptions**.
+- **Marker‑based posture introspection:** `guardio.launcher` / `guardio.agent` system properties expose live
+  protection state to `/guardio version` and (roadmap) `/guardio doctor`.
+- **Alerting:** Discord webhook (embed or plain, role‑mention, per‑event gating), inheriting the launcher
+  webhook when unset; fully externalized, recolorable/translatable message catalog (`messages.yml`).
+
+---
+
+## 8. Deployment
+
+Place `guardio-v1.0.0.jar` in the server root; the real server jar in root or `guardio/serverjar/`.
+- **Double‑click** the jar (a console is spawned), or **`java -Xmx4G -jar guardio-v1.0.0.jar`**, or point any
+  panel's startup jar at it. First boot provisions `guardio/` (config + vault), relocates the server jar into
+  `guardio/serverjar/`, syncs an in‑server plugin copy, scans/heals, then forks + supervises the server.
+- **Agent‑only** (no launcher): `java -javaagent:guardio-v1.0.0.jar -jar guardio/serverjar/<server>.jar nogui`.
+
+**Control surface** (`/guardio`, alias `/guard`, perm `guardio.admin`, tab‑completed):
+`scan · status · version · trust [all|<jar>] · restore <jar> · allow <jar> · heal · reload <plugin>`.
+
+**Configuration:** `guardio/config.yml` (sectioned: `general · scanning · response · heal · threat-feed ·
+discord · signatures`), `guardio/messages.yml` (i18n), `guardio/guardio.properties` (launcher), `guardio/sources.yml`
+(provisioning overrides), `guardio/trusted/` (operator backups).
+
+---
+
+## 9. Boundary conditions (honest limits)
+
+Guardio enforces integrity of the **server tree**; it is **not** a host‑level EDR. OS‑resident persistence,
+exfiltrated credentials, or a trojanized OS/JRE are out of scope — a compromised host requires OS remediation
+and credential rotation independent of Guardio. Premium artifacts without a free distribution channel cannot be
+auto‑provisioned and are flagged for manual reinstatement (or served from `guardio/trusted/`). The heuristic
+layer is advisory by design and must not be interpreted as a definitive verdict.
+
+---
+
+## 10. Test harness
+
+`test-harness/` builds **GuardioTester** — a non‑malicious instrumentation plugin that emits inert decoy
+artifacts (Base64‑encoded markers, so the harness itself is not flagged) exercising L1–L4, quarantine/restore,
+threat‑feed‑by‑hash, and reload idempotency via `/gtest {signature│heuristic│feedtest│tamper│id│clean}`.

@@ -1,75 +1,77 @@
 # ============================================================================
-#  PluginGuard — пази целостта на папката /plugins (МОДЕЛ: map-then-load).
-#
-#  • НОВ плъгин → проверява се за сигнатури; ако е чист, се "мапва" (копира се
-#    в vault/) като еталон. Ако носи сигнатура — карантинира се и НЕ се мапва.
-#  • МАПНАТ плъгин → ако живият jar съвпада с мапнатото копие, се зарежда както
-#    е; ако се различава (заразен/подменен/обновен) — живият се карантинира и се
-#    възстановява безопасното мапнато копие.
-#
-#  Истинската защита "преди всички плъгини" е АГЕНТЪТ (виж README) — добави в
-#  стартовия скрипт:  -javaagent:plugins/PluginGuard-1.0.0.jar
-#  Като ПЛЪГИН (без агента) подмяната се прилага при изключване (jar-овете са
-#  заключени по време на работа), тоест важи от СЛЕДВАЩОТО стартиране.
-#
-#  ВАЖНО: PluginGuard пази ЧИСТА основа. Първо изчисти машината и сложи чисти
-#  jar-ове — чак тогава остави авто-мапването да ги запомни (или `/guard trust all`).
-#  Легитимно обновяване със същото име на файл → ще се върне към мапнатото;
-#  приеми новата версия с `/guard trust <jar>`.
+#  Guardio — whole-server integrity guard & malware remediation engine
+#  Layout: guardio-v1.0.0.jar (root launcher) + /guardio (home) + this file.
+#  Editing: change values, then `/guardio reload Guardio` or restart.
+#  Do the first boot on a CLEAN install so the trusted baseline is clean.
 # ============================================================================
+config-version: 2
 
-scan-on-load: true              # сканирай при зареждане
-auto-map: true                  # мапвай нови чисти jar-ове в vault/ автоматично
+general:
+  # Name shown in alerts/reports. "" = the server folder name.
+  server-name: ""
+  # Scan the whole tree when the plugin loads.
+  scan-on-load: true
+  # Re-scan every N minutes while running (0 = off).
+  periodic-scan-minutes: 0
+  # Notify online operators in-game when something is found.
+  alert-ops: true
+  # Check for a newer Guardio release on startup (logs only; never auto-downloads).
+  update-check: true
 
-# --- Авто-лечение: при заразен плъгин БЕЗ чисто копие във vault, свали чисто отвън ---
-auto-download: true             # сваляй чисто копие за заразени плъгини (САМО безплатни източници)
-download-game-version: ""       # "" = авто (версията на сървъра); или фиксирай напр. "1.21.11"
-# Източник по подразбиране = Modrinth (по име). Ръчни препратки: plugins/PluginGuard/sources.yml
-# (ключ = име на плъгина или име на jar; стойност = modrinth:<slug> | url:<jar-url> | github:<owner/repo>).
-# Премиум/частни плъгини НЕ могат да се свалят автоматично — маркират се за ръчно преинсталиране.
+scanning:
+  # Folders (relative to the server root) scanned recursively. The server jar is always guarded.
+  roots:
+    - "plugins"
+    - "libraries"
+  # Report-only behavioural analysis (flags backdoor patterns; never auto-quarantines).
+  heuristics: true
 
-# Кои папки да се пазят (релативно към сървър-руут). Сървърният jar в руута (purpur/paper)
-# се пази ВИНАГИ. ЗАБ.: мапването копира jar-овете във vault/ (диск ≈ размера на jar-овете);
-# махни "libraries", ако искаш по-малко диск. versions/cache са по избор (Paper ги регенерира).
-scan-roots:
-  - "plugins"
-  - "libraries"
-# - "versions"
-# - "cache"
+response:
+  # Move infected jars into guardio/quarantine/.
+  auto-quarantine: true
+  # Restore the clean copy from the vault when a guarded jar changes.
+  auto-restore: true
+  # Map new clean jars into the vault baseline automatically.
+  auto-map: true
+  # Stop the server if infection is found at boot (off by default).
+  shutdown-on-infection: false
 
-periodic-scan-minutes: 0        # >0 = пресканирай на всеки N минути докато върви
-alert-ops: true                 # съобщавай на онлайн оператори при засичане
-auto-quarantine: true           # мести заразените в quarantine/
-auto-restore: true              # възстановявай безопасните от vault/
-shutdown-on-infection: false    # спри сървъра, ако се засече зараза на старта
+heal:
+  # Download a clean replacement (free sources + guardio/trusted/ backups) for an infected plugin with no vault copy.
+  auto-download: true
+  # Minecraft version for downloads. "" = auto-detect from the server.
+  game-version: ""
 
-# --- Аларми по Discord webhook (празно = изключено): праща при карантина/лечение/съмнение ---
-discord-webhook: ""             # напр. https://discord.com/api/webhooks/....
-server-name: ""                 # име в алармите ("" = името на папката на сървъра)
+threat-feed:
+  # URL to a known-malware SHA-256 list (one hash per line; "#" comments). "" = disabled.
+  # Cached to guardio/threat-feed.txt; a hash match is authoritative and overrides trust.
+  url: ""
 
-# --- Threat-intel feed: URL към списък с SHA-256 на познат малуер (1 на ред, "#"=коментар; ""=изкл.).
-#     Хваща познат payload дори преименуван. Кешира се в guardio/threat-feed.txt. ---
-threat-feed-url: ""
+# ----------------------------------------------------------------------------
+#  Discord alerts. The launcher (pre-boot) reads `discord-webhook` in guardio.properties;
+#  the plugin uses the webhook below, FALLING BACK to that one if this is blank — set it once.
+# ----------------------------------------------------------------------------
+discord:
+  enabled: false
+  webhook: ""
+  # Role pinged on an infection/quarantine, e.g. "123456789012345678". "" = no ping.
+  mention-role-id: ""
+  # true = rich embed, false = plain text line.
+  embeds: true
+  alerts:
+    quarantine: true
+    restore: true
+    heal: true
+    suspicious: true
 
-# --- Евристика (САМО ДОКЛАД, не карантинира): маркира backdoor-поведения по плъгините
-#     (runtime defineClass, отдалечено зареждане на класове, Runtime.exec). ---
-heuristics: true
-
-# --- Премиум/платени плъгини без безплатен източник: сложи ЧИСТО копие в guardio/trusted/ ;
-#     при зараза Guardio ще възстанови оттам (след проверка, че копието е чисто). ---
-
-# --- Сигнатури: само МАЛУЕР-СПЕЦИФИЧНИ (тези низове/пътища ГИ НЯМА в истински библиотеки),
-#     за да няма фалшиви аларми по легитимни плъгини. Напр. Nexo ползва checkip.amazonaws.com за
-#     self-host, а java_websocket/dev.jnic ползват легитимни/обфускирани плъгини — затова НЕ са тук. ---
-content-signatures:             # текст, търсен В .class файловете
-  - "pluginstatstrack"          # уникалният C2 домейн на този малуер
-entry-signatures:               # имена на zip-записи = скрити пакети (липсват в истинския javassist)
-  - "javassist/orgs/"
-  - "javassist/ws/"
-
-# Фалшива аларма? Сложи името на jar-а (или част от него) в plugins/PluginGuard/whitelist.txt
-# (по едно на ред), или в игра:  /guard allow <jar>.  Whitelist-натите се пропускат при
-# сигнатурната проверка, но пак се пазят чрез integrity hash (vault).
-
-ignore:                         # файлове (по име, без .jar), които НИКОГА да не сканира/пипа
-  - "PluginGuard"
+# ----------------------------------------------------------------------------
+#  ADVANCED — malware signatures (only strings/paths absent from real libraries, to avoid
+#  false positives). A false alarm? `/guardio allow <jar>` or add a fragment to
+#  guardio/whitelist.txt. Whitelisted jars skip signatures but are still integrity-checked.
+# ----------------------------------------------------------------------------
+signatures:
+  content:                       # text searched inside .class files
+    - "pluginstatstrack"
+  entry:                         # zip-entry path fragments (hidden packages)
+    - "javassist/orgs/"
+    - "javassist/ws/"

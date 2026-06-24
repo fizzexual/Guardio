@@ -471,6 +471,7 @@ public final class GuardioLauncher {
         List<String> cmd = new ArrayList<>();
         cmd.add(javaBin);
         cmd.addAll(jvm);
+        cmd.add("-Dguardio.launcher=true"); // marker so the in-server plugin knows it was launched via Guardio
         if (Boolean.parseBoolean(cfg.get("use-agent", "true")) && self != null) {
             cmd.add("-javaagent:" + self.getPath());
         }

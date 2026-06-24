@@ -8,21 +8,49 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 /**
- * Posts a one-line alert to a Discord webhook. Pure JDK (no Gson) so the launcher, agent, and plugin can all
- * use it. Synchronous with a short timeout; callers on the main server thread should invoke it off-thread.
+ * Posts alerts to a Discord webhook. Pure JDK (no Gson) so the launcher, agent, and plugin can all use it.
+ * Synchronous with a short timeout; callers on the main server thread should invoke it off-thread.
  */
 final class Notifier {
 
     private Notifier() {
     }
 
+    /** Plain content line (used by the launcher/agent). */
     static void send(String webhook, String content) {
-        if (webhook == null || webhook.isBlank() || content == null || content.isBlank()) {
+        if (content == null || content.isBlank()) {
+            return;
+        }
+        String c = content.length() > 1900 ? content.substring(0, 1900) + "…" : content;
+        post(webhook, "{\"content\":\"" + escape(c) + "\"}");
+    }
+
+    /** Plugin send: optional role mention + plain-or-embed formatting. */
+    static void send(String webhook, String roleMention, String text, boolean embed) {
+        if (text == null || text.isBlank()) {
+            return;
+        }
+        String mention = roleMention == null ? "" : roleMention;
+        String json;
+        if (embed) {
+            String desc = text.length() > 3900 ? text.substring(0, 3900) + "…" : text;
+            json = "{\"content\":\"" + escape(mention) + "\",\"embeds\":[{\"title\":\"Guardio\",\"description\":\""
+                    + escape(desc) + "\",\"color\":15158332}]}";
+        } else {
+            String c = mention + text;
+            if (c.length() > 1900) {
+                c = c.substring(0, 1900) + "…";
+            }
+            json = "{\"content\":\"" + escape(c) + "\"}";
+        }
+        post(webhook, json);
+    }
+
+    private static void post(String webhook, String json) {
+        if (webhook == null || webhook.isBlank()) {
             return;
         }
         try {
-            String msg = content.length() > 1900 ? content.substring(0, 1900) + "…" : content;
-            String json = "{\"content\":\"" + escape(msg) + "\"}";
             HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
             HttpRequest req = HttpRequest.newBuilder(URI.create(webhook))
                     .header("Content-Type", "application/json")

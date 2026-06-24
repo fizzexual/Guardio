@@ -1,0 +1,69 @@
+# Guardio messages — edit/translate freely. '&' colour codes; {braces} are placeholders.
+prefix: "&8[&bGuardio&8]&r "
+
+banner:
+  - "&8&m                                            "
+  - " &b&lGUARDIO &7v{version} &8| &7whole-server integrity guard"
+  - " &7vault &f{vault}&7 jars &8| &7launcher &f{launcher} &8| &7agent &f{agent}"
+  - "&8&m                                            "
+
+command:
+  unknown: "&7/guardio &f<scan | status | trust [all|<jar>] | restore <jar> | allow <jar> | heal | reload <plugin> | version>"
+
+scan:
+  complete: "&aScan complete: &f{total}&a jar(s), &c{infected}&a infected, &e{unverified}&a unverified."
+  infected-line: "  &cINFECTED &f{rel} &7- {reason}"
+  staged: "&e{count}&7 fix(es) staged — restart to apply."
+
+status: "&7Vault: &f{vault}&7 jars &8| &7last scan &f{total}&7 (&c{infected}&7 infected, &e{unverified}&7 unverified) &8| &e{staged}&7 staged for restart."
+
+trust:
+  usage: "&cUsage: /guardio trust <all|jarName>  &7(only trust VERIFIED-clean jars!)"
+  all: "&aTrusted &f{count}&a jar(s) into the vault baseline."
+  warn: "&e⚠ Only do this on a VERIFIED-clean install."
+  one: "&aTrusted &f{jar}&a into the vault."
+  none: "&cNo such jar: {jar}"
+  fail: "&cFailed to trust {jar}"
+
+restore:
+  usage: "&cUsage: /guardio restore <jarName>"
+  none: "&cNo clean vault copy matching '{jar}'."
+  staged: "&aStaged restore of &f{jar}&a from vault — restart to apply."
+
+allow:
+  usage: "&cUsage: /guardio allow <jarName>  &7(clear a false positive)"
+  done: "&aWhitelisted &f{jar}&a — signature ignored and mapped as trusted."
+  fail: "&cFailed to whitelist: {error}"
+
+heal:
+  started: "&aAuto-heal started — downloading clean copies for quarantined plugins. Watch console / heal-report.txt."
+  done: "&a[Guardio] auto-heal: &f{healed}&a healed, &e{manual}&a need manual reinstall.{restart}"
+  restart-hint: " &7Restart to load the clean copies."
+
+reload:
+  usage: "&cUsage: /guardio reload <pluginName>  &7(clean reload — no double-registration)"
+  line: "&7- &f{line}"
+  line-warn: "&e- {line}"
+  ok: "&aReloaded &f{plugin}&a cleanly."
+  fail: "&cReload of &f{plugin}&c did not complete — see above."
+
+version:
+  - "&b&lGuardio &7v{version}"
+  - "&7Vault: &f{vault}&7 jars &8| &7launcher &f{launcher} &8| &7agent &f{agent}"
+  - "&7Update: {update}"
+
+update:
+  current: "&aup to date"
+  available: "&e{latest} available"
+  unknown: "&7(check skipped)"
+
+pending: "&e{count} infected jar(s) staged — RESTART to apply (enable the launcher/-javaagent for pre-load protection)."
+
+# Discord (markdown; no colour codes)
+discord:
+  header: "**Guardio / {server}** ({context}):"
+  quarantine: "🔑 quarantined infected `{rel}` :: {reason}"
+  restore: "♻️ restored `{rel}`"
+  heal: "✅ healed `{rel}`  <-  {source}"
+  suspicious: "⚠️ suspicious (report-only) `{rel}` :: {reason}"
+  infected: "🛑 INFECTED `{rel}` :: {reason}"

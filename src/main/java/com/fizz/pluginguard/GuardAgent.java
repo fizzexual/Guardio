@@ -44,6 +44,7 @@ public final class GuardAgent {
     }
 
     private static void run(String args) {
+        System.setProperty("guardio.agent", "true"); // marker so the plugin knows the pre-load agent ran
         try {
             File serverRoot = ((args != null && !args.isBlank()) ? new File(args.trim()) : new File("."))
                     .getAbsoluteFile();
