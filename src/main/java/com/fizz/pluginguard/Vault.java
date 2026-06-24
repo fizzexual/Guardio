@@ -4,9 +4,9 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The trusted baseline: a {@code vault/} folder that MIRRORS the guarded tree — entries are keyed by their
@@ -18,7 +18,8 @@ import java.util.Map;
 final class Vault {
 
     private final File dir;
-    private final Map<String, String> hashes = new HashMap<>(); // relative path -> sha256
+    // Concurrent: written by the scan executor, the async heal task, and main-thread commands; read on all three.
+    private final Map<String, String> hashes = new ConcurrentHashMap<>(); // relative path -> sha256
 
     Vault(File guardFolder) {
         this.dir = new File(guardFolder, "vault");

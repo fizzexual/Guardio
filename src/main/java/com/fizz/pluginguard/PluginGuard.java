@@ -36,6 +36,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -61,7 +62,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     private FileConfiguration config;
     private Messages msg;
     private List<String> roots;
-    private List<String> whitelist;
+    private volatile List<String> whitelist; // reassigned on the main thread (allow cmd), read on the scan thread
     private boolean autoQuarantine;
     private boolean autoRestore;
     private boolean autoMap;
@@ -96,6 +97,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     private Map<String, String> prevSnapshot = new HashMap<>();    // rel -> sha, from the previous scan
     private FileWatcher watcher;
     private DownloadServer downloadServer;
+    private Thread remediateHook;
 
     @Override
     public void onLoad() {
@@ -150,7 +152,8 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
             Honeypot.deploy(serverRoot, home);
         }
 
-        Runtime.getRuntime().addShutdownHook(new Thread(this::applyPending, "Guardio-remediate"));
+        this.remediateHook = new Thread(this::applyPending, "Guardio-remediate");
+        Runtime.getRuntime().addShutdownHook(remediateHook);
 
         if (c.getBoolean("general.scan-on-load", true)) {
             getLogger().info("Scanning the server (plugins + libraries + server jar) for tampering/infection...");
@@ -227,6 +230,16 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         if (scanExecutor != null) {
             scanExecutor.shutdownNow();
         }
+        if (healer != null) {
+            healer.close(); // shut down its HttpClient SelectorManager thread (no leak across /reload)
+        }
+        if (remediateHook != null) {
+            try {
+                Runtime.getRuntime().removeShutdownHook(remediateHook); // let this dead instance be GC'd
+            } catch (IllegalStateException ignored) {
+                // already shutting down
+            }
+        }
     }
 
     // ---- Config -------------------------------------------------------------
@@ -236,14 +249,38 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         copyResourceIfMissing("config.yml", cfgFile);
         FileConfiguration c = YamlConfiguration.loadConfiguration(cfgFile);
         if (c.getInt("config-version", 1) < 2) {
+            File old = new File(home, "config.yml.old");
+            File fresh = new File(home, "config.yml.new");
             try {
-                Files.move(cfgFile.toPath(), new File(home, "config.yml.old").toPath(), StandardCopyOption.REPLACE_EXISTING);
-            } catch (IOException ignored) {
-                // best effort
+                // Stage the new config to a temp file and VERIFY it before touching the live one — so a failure
+                // can never leave the server with no config (which would silently reset every setting).
+                try (InputStream in = getResource("config.yml")) {
+                    if (in == null) {
+                        getLogger().warning("no bundled config to upgrade to — keeping your current config.yml.");
+                        return c;
+                    }
+                    Files.copy(in, fresh.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+                if (!fresh.isFile() || fresh.length() == 0) {
+                    getLogger().warning("config upgrade aborted (couldn't stage the new config) — keeping current.");
+                    fresh.delete();
+                    return c;
+                }
+                Files.move(cfgFile.toPath(), old.toPath(), StandardCopyOption.REPLACE_EXISTING);  // back up old
+                Files.move(fresh.toPath(), cfgFile.toPath(), StandardCopyOption.REPLACE_EXISTING); // promote new
+                c = YamlConfiguration.loadConfiguration(cfgFile);
+                getLogger().info("Upgraded config.yml to the new format (your old one is saved as config.yml.old).");
+            } catch (IOException ex) {
+                getLogger().severe("config upgrade failed (" + ex.getMessage() + ") — keeping your existing config.");
+                if (!cfgFile.isFile() && old.isFile()) { // restore the backup if we lost the live file
+                    try {
+                        Files.move(old.toPath(), cfgFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    } catch (IOException ignored) {
+                        // nothing more we can do
+                    }
+                }
+                c = YamlConfiguration.loadConfiguration(cfgFile);
             }
-            copyResourceIfMissing("config.yml", cfgFile);
-            c = YamlConfiguration.loadConfiguration(cfgFile);
-            getLogger().info("Upgraded config.yml to the new format (your old one is saved as config.yml.old).");
         }
         return c;
     }
@@ -342,24 +379,39 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         Map<String, String> snapshot = new LinkedHashMap<>();
         for (File jar : Roots.listJars(serverRoot, roots, home)) {
             String rel = Vault.rel(serverRoot, jar);
-            String sha = cachedSha(jar);
+            List<String> sigReasons = scanner.scan(jar);
+            if (JarScanner.unreadableOnly(sigReasons)) {
+                // transient lock / IO error — could NOT read it; do not treat as malware. Skip this scan.
+                getLogger().warning("could not read " + rel + " (" + sigReasons.get(0) + ") — skipped this scan");
+                String prevSha = prevSnapshot.get(rel);
+                if (prevSha != null) {
+                    snapshot.put(rel, prevSha); // keep the prior entry so the change report isn't skewed
+                }
+                continue;
+            }
+            boolean inVault = vault.has(rel);
+            // Vaulted jars are always hashed FRESH (the incremental cache could otherwise return a stale hash
+            // for a same-size/same-mtime swap); only not-yet-mapped jars use the cache.
+            String sha = inVault ? Hashing.sha256(jar) : cachedSha(jar);
             if (sha != null) {
                 snapshot.put(rel, sha);
             }
-            List<String> sigReasons = scanner.scan(jar);
             boolean feedHit = threatFeed != null && threatFeed.contains(sha);
+            boolean isPlugin = rel.startsWith("plugins");
+            boolean allowlistBlock = allowlistOnly && isPlugin && !inVault && !feedHit && sigReasons.isEmpty()
+                    && !Whitelist.allows(jar.getName(), whitelist);
+
             List<String> reasons = new ArrayList<>(sigReasons);
             if (feedHit) {
                 reasons.add("known-malware hash (threat feed)");
             }
-            boolean sigHit = feedHit || (!sigReasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist));
-            boolean inVault = vault.has(rel);
+            if (allowlistBlock) {
+                reasons.add("not on allowlist (allowlist-only mode)");
+            }
+            // Treat an allowlist block as a signature hit so it counts + reports as INFECTED (it is quarantined).
+            boolean sigHit = feedHit || allowlistBlock
+                    || (!sigReasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist));
             boolean hashMatch = inVault && sha != null && sha.equals(vault.hash(rel));
-            boolean isPlugin = rel.startsWith("plugins");
-
-            // Allowlist-only: a NEW plugin that isn't mapped/whitelisted is refused (not auto-mapped).
-            boolean allowlistBlock = allowlistOnly && isPlugin && !inVault && !sigHit
-                    && !Whitelist.allows(jar.getName(), whitelist);
 
             ScanResult r = new ScanResult(jar, sha, sigHit, inVault, hashMatch, reasons);
             results.add(r);
@@ -370,14 +422,6 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
                 getLogger().severe("INFECTED: " + rel + "  ->  " + what);
                 if (discordAlert("quarantine")) {
                     events.add(msg.plain("discord.infected", "rel", rel, "reason", what));
-                }
-                if (remediate && autoQuarantine) {
-                    stageRemediation(jar, rel);
-                }
-            } else if (allowlistBlock) {
-                getLogger().severe("NOT ON ALLOWLIST (allowlist-only mode): " + rel);
-                if (discordAlert("quarantine")) {
-                    events.add(msg.plain("discord.infected", "rel", rel, "reason", "not on allowlist (allowlist-only mode)"));
                 }
                 if (remediate && autoQuarantine) {
                     stageRemediation(jar, rel);
@@ -492,14 +536,34 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     }
 
     private void stageRemediation(File jar, String rel) {
-        File clean = (autoRestore && vault.has(rel)) ? vault.file(rel) : null;
-        pending.add(new Pending(jar, rel, clean, new File(home, "quarantine")));
-        if (clean == null) {
-            getLogger().warning("  no clean copy in vault for " + rel + " — it will be quarantined; reinstall a clean one.");
+        synchronized (pending) {
+            for (Pending p : pending) {
+                if (p.rel().equals(rel)) {
+                    return; // already staged — don't double-remediate the same jar
+                }
+            }
+            // Don't restore from the vault if the vault copy IS the known-malware (a feed hash on a previously
+            // trusted jar) — that would re-install the payload. Quarantine only; let heal fetch a clean copy.
+            boolean vaultIsMalware = vault.has(rel) && threatFeed != null && threatFeed.contains(vault.hash(rel));
+            File clean = (autoRestore && vault.has(rel) && !vaultIsMalware) ? vault.file(rel) : null;
+            pending.add(new Pending(jar, rel, clean, new File(home, "quarantine")));
+            if (clean == null) {
+                getLogger().warning("  no clean vault copy to restore for " + rel + " — it will be quarantined; reinstall a clean one.");
+            }
         }
     }
 
     private void applyPending() {
+        // Stop any in-flight scan first: the scan thread is a daemon that keeps running during JVM shutdown,
+        // and it reads the same jars we're about to move/overwrite here.
+        if (scanExecutor != null) {
+            scanExecutor.shutdownNow();
+            try {
+                scanExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
         List<Pending> copy;
         synchronized (pending) {
             if (pending.isEmpty()) {
@@ -792,8 +856,12 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
                     send(sender, msg.get("restore.none", "jar", args[1]));
                     return true;
                 }
-                stageRemediation(jar, Vault.rel(serverRoot, jar));
+                String rrel = Vault.rel(serverRoot, jar);
+                stageRemediation(jar, rrel);
                 send(sender, msg.get("restore.staged", "jar", args[1]));
+                if (discordAlert("restore")) {
+                    notify("restore", List.of(msg.plain("discord.restore", "rel", rrel)));
+                }
             }
             case "allow" -> {
                 if (args.length < 2) {

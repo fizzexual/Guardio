@@ -70,6 +70,15 @@ final class Healer {
         this.scanner = scanner;
     }
 
+    /** Shuts down the long-lived HttpClient's SelectorManager thread + connection pool (Java 21 AutoCloseable). */
+    void close() {
+        try {
+            http.close();
+        } catch (Throwable ignored) {
+            // best effort
+        }
+    }
+
     /** Downloads + verifies a clean copy; {@code override} (may be null) wins over a Modrinth name search. */
     Result fetchClean(String name, String version, String gameVersion, String override) {
         try {

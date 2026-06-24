@@ -108,7 +108,10 @@ defects endemic to naïve disable/enable cycles. Classloader disposal (`URLClass
 nulling) releases the artifact handle and admits GC. Re‑entry uses Paper's runtime loader
 (`PaperPluginManagerImpl.instanceManager#loadPlugin(Path)`) — the Bukkit‑interface `loadPlugin(File)` routes
 through provider storage and fails at runtime. Dependents are dependency‑graph‑resolved and warned;
-`paper-plugin.yml` bootstrap plugins are refused (incompatible with runtime re‑entry).
+`paper-plugin.yml` bootstrap plugins (and hybrids that ship one) are refused (incompatible with runtime
+re‑entry). **Caveat:** a reloaded plugin's *commands* are re‑registered best‑effort, but on Paper 1.21+ the
+legacy command may remain in Brigadier's dispatcher until a full restart — use the namespaced `/plugin:cmd`
+form in the interim, or restart to fully re‑bind. Listeners/tasks/services/channels re‑bind cleanly regardless.
 
 ---
 

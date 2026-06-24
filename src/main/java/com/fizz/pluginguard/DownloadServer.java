@@ -148,8 +148,13 @@ final class DownloadServer {
 
         StringBuilder html = new StringBuilder(2048);
         html.append("<!DOCTYPE html><html><head><meta charset=\"utf-8\">")
-            .append("<title>PluginGuard Downloads</title></head><body>")
-            .append("<h1>PluginGuard Downloads</h1>");
+            .append("<title>Guardio Downloads</title></head><body>")
+            .append("<h1>Guardio Downloads</h1>")
+            // The token is NEVER embedded in the page or links (it would leak into history/proxy logs). Fetch
+            // with the header, e.g.:  curl -H "X-Guardio-Token: <token>" -O http://host:20010/dl?path=<path>
+            .append("<p>Fetch a file with your token in the <code>X-Guardio-Token</code> header:<br>")
+            .append("<code>curl -H \"X-Guardio-Token: &lt;token&gt;\" -OJ http://&lt;host&gt;:")
+            .append(port).append("/dl?path=&lt;path&gt;</code></p>");
 
         for (Map.Entry<String, Path> base : allowedBases().entrySet()) {
             html.append("<h2>").append(htmlEscape(base.getKey())).append("</h2><ul>");
@@ -158,9 +163,9 @@ final class DownloadServer {
                 html.append("<li><em>(none)</em></li>");
             } else {
                 for (String rel : rels) {
-                    String href = "/dl?path=" + urlEncode(rel) + "&token=" + urlEncode(token);
-                    html.append("<li><a href=\"").append(htmlEscape(href)).append("\">")
-                        .append(htmlEscape(rel)).append("</a></li>");
+                    // path only — no token in the link
+                    html.append("<li><code>/dl?path=").append(htmlEscape(urlEncode(rel))).append("</code> ")
+                        .append(htmlEscape(rel)).append("</li>");
                 }
             }
             html.append("</ul>");

@@ -9,6 +9,7 @@ import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.PluginManager;
 
 import java.io.File;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.URLClassLoader;
@@ -16,6 +17,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.zip.ZipFile;
@@ -70,23 +72,35 @@ final class Reloader {
         }
 
         Level prev = target.getLogger().getLevel();
+        boolean unloaded = false;
         try {
             target.getLogger().setLevel(Level.WARNING); // quiet the plugin's own INFO chatter during the cycle
             forcedTeardown(target, out);
             pm.disablePlugin(target);
             unload(target, out);
+            unloaded = true;
+            // Don't reload into a dirty manager: confirm the old instance is actually gone first.
+            if (pm.getPlugin(name) != null) {
+                return new Result(false, append(out, name + " could not be fully unloaded from the plugin manager "
+                        + "— aborting reload. It is now UNLOADED; restart the server."));
+            }
 
             Plugin loaded = loadPlugin(pm, file);
             if (loaded == null) {
-                return new Result(false, append(out, "loadPlugin returned null — reload failed; restart the server."));
+                return new Result(false, append(out, "loadPlugin returned null — " + name
+                        + " is now UNLOADED; restart the server."));
             }
+            registerCommands(loaded, out); // re-bind plugin.yml commands BEFORE enable (runtime load doesn't)
             pm.enablePlugin(loaded);
             loaded.getLogger().setLevel(prev);
             out.add("reloaded " + loaded.getName() + " v" + loaded.getDescription().getVersion() + " cleanly.");
             return new Result(true, out);
         } catch (Throwable t) {
+            String tail = unloaded
+                    ? " — " + name + " is now UNLOADED (its old version is no longer running); restart the server."
+                    : " — restart the server to be safe.";
             return new Result(false, append(out, "reload error: " + t.getClass().getSimpleName()
-                    + (t.getMessage() != null ? " - " + t.getMessage() : "") + " — restart the server to be safe."));
+                    + (t.getMessage() != null ? " - " + t.getMessage() : "") + tail));
         }
     }
 
@@ -136,6 +150,56 @@ final class Reloader {
                 cmd.unregister(map);
                 it.remove();
             }
+        }
+    }
+
+    /** Re-registers the plugin's plugin.yml commands into the command map bound to the reloaded instance —
+     *  Paper's runtime loadPlugin(Path) doesn't wire these up, so the commands would otherwise break. */
+    private static void registerCommands(Plugin plugin, List<String> out) {
+        try {
+            Map<String, Map<String, Object>> cmds = plugin.getDescription().getCommands();
+            if (cmds == null || cmds.isEmpty()) {
+                return;
+            }
+            CommandMap map = Bukkit.getServer().getCommandMap();
+            Constructor<PluginCommand> ctor = PluginCommand.class.getDeclaredConstructor(String.class, Plugin.class);
+            ctor.setAccessible(true);
+            int n = 0;
+            for (Map.Entry<String, Map<String, Object>> e : cmds.entrySet()) {
+                PluginCommand pc = ctor.newInstance(e.getKey(), plugin);
+                Map<String, Object> meta = e.getValue();
+                if (meta != null) {
+                    if (meta.get("description") != null) {
+                        pc.setDescription(meta.get("description").toString());
+                    }
+                    if (meta.get("usage") != null) {
+                        pc.setUsage(meta.get("usage").toString());
+                    }
+                    if (meta.get("permission") != null) {
+                        pc.setPermission(meta.get("permission").toString());
+                    }
+                    Object aliases = meta.get("aliases");
+                    if (aliases instanceof List<?> al) {
+                        List<String> a = new ArrayList<>();
+                        for (Object o : al) {
+                            a.add(o.toString());
+                        }
+                        pc.setAliases(a);
+                    } else if (aliases != null) {
+                        pc.setAliases(List.of(aliases.toString()));
+                    }
+                }
+                map.register(plugin.getName().toLowerCase(Locale.ROOT), pc);
+                n++;
+            }
+            if (n > 0) {
+                out.add("re-registered " + n + " command(s) — note: on Paper 1.21+ a command may stay bound to "
+                        + "the old version in Brigadier until a full restart; use '/" + plugin.getName().toLowerCase(Locale.ROOT)
+                        + ":<cmd>' meanwhile, or restart to fully re-bind.");
+            }
+        } catch (Throwable t) {
+            out.add("note: could not re-register commands (" + t.getClass().getSimpleName()
+                    + ") — they may need a restart.");
         }
     }
 
@@ -195,7 +259,11 @@ final class Reloader {
         if (cl instanceof URLClassLoader u) {
             nullField(cl, "plugin");      // break PluginClassLoader -> plugin back-refs to help GC
             nullField(cl, "pluginInit");
-            u.close();                    // release the jar lock + free classes
+            try {
+                u.close();                // release the jar lock + free classes
+            } catch (Throwable ignored) {
+                // a close failure must not abort the reload after the manager lists are already mutated
+            }
         }
         out.add("unloaded " + plugin.getName() + " (removed from manager, classloader closed).");
     }
@@ -250,7 +318,9 @@ final class Reloader {
 
     private static boolean isPaperPlugin(File jar) {
         try (ZipFile z = new ZipFile(jar)) {
-            return z.getEntry("paper-plugin.yml") != null && z.getEntry("plugin.yml") == null;
+            // Any jar with paper-plugin.yml is loaded by Paper's new system (even if it also ships plugin.yml
+            // as a Spigot fallback) and can't be runtime-reloaded.
+            return z.getEntry("paper-plugin.yml") != null;
         } catch (Exception ex) {
             return false;
         }

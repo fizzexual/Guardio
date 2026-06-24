@@ -19,6 +19,12 @@ final class JarScanner {
 
     private static final int MAX_REASONS = 10;
     private static final long MAX_CLASS_BYTES = 3_000_000L;
+    static final String UNREADABLE_PREFIX = "unreadable jar";
+
+    /** True if the only "reason" is that the jar couldn't be read (transient lock/IO) — NOT a malware match. */
+    static boolean unreadableOnly(List<String> reasons) {
+        return reasons.size() == 1 && reasons.get(0).startsWith(UNREADABLE_PREFIX);
+    }
 
     private final List<String> entrySignatures;
     private final List<String> contentSignatures;
@@ -55,7 +61,7 @@ final class JarScanner {
                 }
             }
         } catch (IOException ex) {
-            reasons.add("unreadable jar (" + ex.getMessage() + ")");
+            reasons.add(UNREADABLE_PREFIX + " (" + ex.getMessage() + ")");
         }
         return reasons;
     }

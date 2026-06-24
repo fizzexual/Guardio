@@ -91,7 +91,10 @@ final class Honeypot {
                 continue;
             }
             String actual = sha256(f);
-            if (actual == null || !actual.equals(expected)) {
+            if (actual == null) {
+                continue; // couldn't read it right now (transient lock) — inconclusive, not a tamper alert
+            }
+            if (!actual.equals(expected)) {
                 tripped.add("canary MODIFIED: " + rel);
             }
         }

@@ -137,28 +137,79 @@ public final class GuardioLauncher {
         Vault vault = new Vault(guardFolder);
         if (flag.exists()) {
             int n = 0;
+            int failed = 0;
             for (File jar : Roots.listJars(serverRoot, List.of("plugins"), guardFolder)) {
                 String rel = Vault.rel(serverRoot, jar);
                 String sha = Hashing.sha256(jar);
                 boolean verified = vault.has(rel) && sha != null && sha.equals(vault.hash(rel));
-                if (!verified && copy(jar, new File(held, rel)) && jar.delete()) {
-                    n++;
+                if (!verified) {
+                    if (move(jar, new File(held, rel))) { // atomic: success means the original is GONE
+                        n++;
+                    } else {
+                        failed++;
+                        logRed("SAFE MODE: could NOT hold " + rel + " (it is still in plugins/ and WILL load).");
+                    }
                 }
             }
-            logRed("SAFE MODE: held " + n + " un-verified plugin(s) in guardio/safemode-held/. Only vault-verified "
-                    + "plugins will load. Delete 'guardio.safemode' to restore them.");
+            logRed("SAFE MODE: held " + n + " un-verified plugin(s) in guardio/safemode-held/"
+                    + (failed > 0 ? " (" + failed + " could NOT be held — see above)" : "")
+                    + ". Only vault-verified plugins will load. Delete 'guardio.safemode' to restore them.");
         } else if (held.isDirectory()) {
             List<File> jars = new ArrayList<>();
             collectJars(held, jars);
             int n = 0;
+            int skipped = 0;
             for (File jar : jars) {
-                if (copy(jar, new File(serverRoot, Vault.rel(held, jar))) && jar.delete()) {
+                File dest = new File(serverRoot, Vault.rel(held, jar));
+                if (dest.isFile()) {
+                    String dh = Hashing.sha256(dest);
+                    String hh = Hashing.sha256(jar);
+                    if (dh != null && !dh.equals(hh)) { // a different jar now sits there — don't clobber the newer one
+                        logRed("safe-mode restore: " + Vault.rel(held, jar) + " was changed in plugins/ since it was "
+                                + "held — NOT overwriting (the held copy stays in safemode-held/).");
+                        skipped++;
+                        continue;
+                    }
+                }
+                if (move(jar, dest)) {
                     n++;
                 }
             }
-            if (n > 0) {
-                banner("safe mode off - restored " + n + " held plugin(s) to plugins/.");
+            pruneEmptyDirs(held);
+            if (n > 0 || skipped > 0) {
+                banner("safe mode off - restored " + n + " held plugin(s)"
+                        + (skipped > 0 ? ", kept " + skipped + " changed one(s) in safemode-held/" : "") + ".");
             }
+        }
+    }
+
+    /** Atomic move (mkdirs + Files.move REPLACE_EXISTING); success guarantees the source no longer exists. */
+    private static boolean move(File from, File to) {
+        try {
+            File p = to.getParentFile();
+            if (p != null) {
+                p.mkdirs();
+            }
+            Files.move(from.toPath(), to.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return true;
+        } catch (IOException ex) {
+            return false;
+        }
+    }
+
+    private static void pruneEmptyDirs(File dir) {
+        File[] fs = dir.listFiles();
+        if (fs == null) {
+            return;
+        }
+        for (File f : fs) {
+            if (f.isDirectory()) {
+                pruneEmptyDirs(f);
+            }
+        }
+        File[] after = dir.listFiles();
+        if (after != null && after.length == 0) {
+            dir.delete();
         }
     }
 
@@ -254,28 +305,34 @@ public final class GuardioLauncher {
         if (serverJar != null) {
             String sha = Hashing.sha256(serverJar);
             boolean missing = !serverJar.isFile();
-            boolean infected = !missing && (!scanner.scan(serverJar).isEmpty() || feed.contains(sha));
-            boolean tampered = !missing && vault.has(serverJarName)
-                    && (sha == null || !sha.equals(vault.hash(serverJarName)));
-            if (missing || infected || tampered) {
-                logRed("server jar " + serverJarName + (missing ? " is MISSING"
-                        : infected ? " is INFECTED" : " was MODIFIED (differs from the trusted copy)")
-                        + " - downloading a clean copy from " + serverJarUrl);
-                if (downloadVerify(serverJarUrl, serverJar, scanner, quarantine, serverJarName)) {
-                    vault.trust(serverJar, serverJarName);
-                    healed++;
-                    events.add("✅ healed server jar `" + serverJarName + "` from the official source");
-                    logGrn("healed server jar from " + serverJarUrl);
-                } else {
-                    logRed("FAILED to heal the server jar - set a correct 'server-jar-url' in guardio.properties. "
-                            + "Refusing to launch a missing/infected server jar.");
-                    Notifier.send(webhook, "🛑 **Guardio / " + serverName + "**: server jar `"
-                            + serverJarName + "` is bad and could not be healed - refusing to start.");
-                    System.exit(2);
+            List<String> sr = missing ? List.of() : scanner.scan(serverJar);
+            if (!missing && JarScanner.unreadableOnly(sr)) {
+                // transient read error — do NOT treat a clean server jar as infected + replace it.
+                logRed("server jar " + serverJarName + " could not be read (" + sr.get(0) + ") - skipping heal this boot.");
+            } else {
+                boolean infected = !missing && (!sr.isEmpty() || feed.contains(sha));
+                boolean tampered = !missing && vault.has(serverJarName)
+                        && (sha == null || !sha.equals(vault.hash(serverJarName)));
+                if (missing || infected || tampered) {
+                    logRed("server jar " + serverJarName + (missing ? " is MISSING"
+                            : infected ? " is INFECTED" : " was MODIFIED (differs from the trusted copy)")
+                            + " - downloading a clean copy from " + serverJarUrl);
+                    if (downloadVerify(serverJarUrl, serverJar, scanner, quarantine, serverJarName)) {
+                        vault.trust(serverJar, serverJarName);
+                        healed++;
+                        events.add("✅ healed server jar `" + serverJarName + "` from the official source");
+                        logGrn("healed server jar from " + serverJarUrl);
+                    } else {
+                        logRed("FAILED to heal the server jar - set a correct 'server-jar-url' in guardio.properties. "
+                                + "Refusing to launch a missing/infected server jar.");
+                        Notifier.send(webhook, "🛑 **Guardio / " + serverName + "**: server jar `"
+                                + serverJarName + "` is bad and could not be healed - refusing to start.");
+                        System.exit(2);
+                    }
+                } else if (!vault.has(serverJarName)) {
+                    vault.trust(serverJar, serverJarName); // first-time baseline of the server jar
+                    mapped++;
                 }
-            } else if (!vault.has(serverJarName)) {
-                vault.trust(serverJar, serverJarName); // first-time baseline of the server jar
-                mapped++;
             }
         }
 
@@ -312,6 +369,10 @@ public final class GuardioLauncher {
                 }
             } else {
                 List<String> sigReasons = scanner.scan(jar);
+                if (JarScanner.unreadableOnly(sigReasons)) {
+                    logRed("could not read " + rel + " (" + sigReasons.get(0) + ") - skipped this scan");
+                    continue;
+                }
                 boolean infected = !sigReasons.isEmpty();
                 if (infected) {
                     String why = String.join("; ", sigReasons);
@@ -485,9 +546,10 @@ public final class GuardioLauncher {
             logRed("the server jar has no Main-Class - can't launch in-process.");
             return false;
         }
-        try {
-            banner("launching server in-process (" + mainClass + ", same JVM, no extra RAM)...");
-            URLClassLoader cl = new URLClassLoader(new URL[]{realJar.toURI().toURL()}, ClassLoader.getSystemClassLoader());
+        banner("launching server in-process (" + mainClass + ", same JVM, no extra RAM)...");
+        // try-with-resources: close the classloader after main returns (a normal stop) so the jar handle is
+        // released — otherwise a later restart can't replace it on Windows, and the loader leaks per restart.
+        try (URLClassLoader cl = new URLClassLoader(new URL[]{realJar.toURI().toURL()}, ClassLoader.getSystemClassLoader())) {
             Thread.currentThread().setContextClassLoader(cl);
             Class<?> m = Class.forName(mainClass, true, cl);
             m.getMethod("main", String[].class).invoke(null, (Object) serverArgs.toArray(new String[0]));
@@ -530,7 +592,17 @@ public final class GuardioLauncher {
         Process proc = new ProcessBuilder(cmd).directory(serverRoot).inheritIO().start();
         Thread hook = new Thread(() -> {
             if (proc.isAlive()) {
-                proc.destroyForcibly(); // panel/Ctrl-C stops Guardio → make sure the child dies too (no orphans)
+                // Ask the server to stop GRACEFULLY first (so it saves chunks/player data), then force-kill if
+                // it doesn't exit in time — avoids world corruption on a panel stop / Ctrl-C.
+                proc.destroy();
+                try {
+                    if (!proc.waitFor(25, java.util.concurrent.TimeUnit.SECONDS)) {
+                        proc.destroyForcibly();
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    proc.destroyForcibly();
+                }
             }
         });
         Runtime.getRuntime().addShutdownHook(hook);
