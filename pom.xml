@@ -70,4 +70,55 @@
             </resource>
         </resources>
     </build>
+
+    <!-- `mvn package -Prelease` produces the OBFUSCATED jar (rename + strip debug). Plain `mvn package` stays
+         readable for development. Entry points (plugin.yml main, Premain/Agent/Main-Class, Bukkit overrides)
+         are kept; the rest of the logic is renamed and stripped to deter source review / cracking. -->
+    <profiles>
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.github.wvengen</groupId>
+                        <artifactId>proguard-maven-plugin</artifactId>
+                        <version>2.7.0</version>
+                        <executions>
+                            <execution>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>proguard</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <obfuscate>true</obfuscate>
+                            <injar>${project.build.finalName}.jar</injar>
+                            <outjar>${project.build.finalName}.jar</outjar>
+                            <includeDependency>true</includeDependency>
+                            <libs>
+                                <lib>${java.home}/jmods/java.base.jmod</lib>
+                                <lib>${java.home}/jmods/java.net.http.jmod</lib>
+                                <lib>${java.home}/jmods/java.management.jmod</lib>
+                                <lib>${java.home}/jmods/java.instrument.jmod</lib>
+                                <lib>${java.home}/jmods/java.logging.jmod</lib>
+                                <lib>${java.home}/jmods/jdk.httpserver.jmod</lib>
+                            </libs>
+                            <options>
+                                <option>-dontshrink</option>
+                                <option>-dontoptimize</option>
+                                <option>-ignorewarnings</option>
+                                <option>-dontnote</option>
+                                <option>-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,Exceptions</option>
+                                <option>-keep public class com.fizz.pluginguard.PluginGuard { *; }</option>
+                                <option>-keep public class com.fizz.pluginguard.GuardioLauncher { public static void main(java.lang.String[]); }</option>
+                                <option>-keep public class com.fizz.pluginguard.GuardAgent { public static void premain(java.lang.String, java.lang.instrument.Instrumentation); public static void agentmain(java.lang.String, java.lang.instrument.Instrumentation); }</option>
+                                <option>-keepclassmembers enum * { public static **[] values(); public static ** valueOf(java.lang.String); }</option>
+                            </options>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
