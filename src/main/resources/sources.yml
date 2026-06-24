@@ -1,0 +1,19 @@
+# PluginGuard — download overrides for the auto-healer.
+#
+# When PluginGuard has to fetch a CLEAN copy of an infected plugin and the automatic Modrinth
+# name-search isn't right (or the plugin isn't on Modrinth), map it here.
+#
+# Key   = the plugin's name (from its plugin.yml) OR its jar filename.
+# Value = one of:
+#   modrinth:<slug>          download the latest matching build from Modrinth
+#   url:<direct-jar-url>     download this exact jar (e.g. a vendor/CI link)
+#   github:<owner/repo>      download the latest GitHub release's .jar asset
+#
+# Premium/private plugins have no free source — leave them out; PluginGuard will flag them
+# for manual reinstall from your own purchase instead of guessing.
+
+overrides:
+  # Examples — uncomment / edit as needed:
+  # ProtocolLib: "github:dmulloy2/ProtocolLib"
+  # ViaVersion: "modrinth:viaversion"
+  # MyCustomPlugin: "url:https://my.cdn/clean/MyCustomPlugin-1.0.jar"
