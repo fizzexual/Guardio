@@ -55,11 +55,22 @@ public final class GuardioLauncher {
 
     public static void main(String[] args) throws Exception {
         boolean scanOnly = Arrays.asList(args).contains("--scan-only");
-        File serverRoot = new File(".").getCanonicalFile();
+        File selfJar = ownJar();
+        // Server root = the folder that holds guardio-v1.0.0.jar, so double-clicking the jar works no matter
+        // what working directory the OS hands us. Falls back to the current directory.
+        File serverRoot = (selfJar != null && selfJar.getParentFile() != null)
+                ? selfJar.getParentFile().getCanonicalFile()
+                : new File(".").getCanonicalFile();
+
+        // Double-clicked on Windows (javaw -> no console)? Reopen in a real console window so the server is
+        // visible and you can type commands; then this windowless process exits.
+        if (!scanOnly && isWindows() && launchedByJavaw() && reopenInConsole(selfJar, serverRoot)) {
+            return;
+        }
+
         File guardFolder = new File(serverRoot, "guardio"); // Guardio's home: vault, quarantine, config, serverjar/
         File serverJarDir = new File(serverRoot, SERVERJAR_DIR);
         serverJarDir.mkdirs();
-        File selfJar = ownJar();
 
         // Tidy layout: move a server jar sitting in the root (old layout / fresh upload) into guardio/serverjar/.
         migrateServerJar(serverRoot, serverJarDir, selfJar);
@@ -533,6 +544,42 @@ public final class GuardioLauncher {
 
     private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    /** True when this JVM was started by javaw.exe (i.e. the jar was double-clicked) — no console. */
+    private static boolean launchedByJavaw() {
+        try {
+            return ProcessHandle.current().info().command()
+                    .map(c -> c.toLowerCase(Locale.ROOT).endsWith("javaw.exe")).orElse(false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Reopens Guardio in a visible console window (via a small launch .bat) so a double-click gives an
+     *  interactive server. Returns false if it couldn't, so the caller can fall back to a (blind) run. */
+    private static boolean reopenInConsole(File self, File serverRoot) {
+        if (self == null) {
+            return false;
+        }
+        try {
+            File bat = new File(serverRoot, "guardio-run.bat");
+            if (!bat.isFile()) {
+                String javaExe = System.getProperty("java.home") + "\\bin\\java.exe";
+                String c = "@echo off\r\n"
+                        + "cd /d \"%~dp0\"\r\n"
+                        + "\"" + javaExe + "\" -jar \"" + self.getName() + "\"\r\n"
+                        + "echo.\r\n"
+                        + "echo Server stopped. Press any key to close.\r\n"
+                        + "pause >nul\r\n";
+                Files.writeString(bat.toPath(), c);
+            }
+            // open a new console window running the .bat (it cd's to its own folder, then runs Guardio)
+            new ProcessBuilder("cmd", "/c", "start", "Guardio Server", bat.getPath()).start();
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
     }
 
     private static void banner(String msg) {
