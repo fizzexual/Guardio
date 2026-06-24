@@ -11,11 +11,16 @@ and **auto‑heals** infected/tampered server jars — built after a self‑spre
 One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and **plugin** (in `plugins/`).
 
 ## What it does
-- **Launcher** (`java -jar Guardio.jar`) — the strongest mode. Runs *before* the server as the parent process,
-  so it can clean and **heal the whole tree including the server jar itself** (download a clean copy from the
-  official Purpur/Paper URL when it's infected, modified, or missing), then launches + supervises the server as
-  a subprocess (with the agent + plugin active inside). Because it runs before any plugin, the infector never
-  executes during a guarded boot, so it can't tamper with Guardio mid‑run; it also self‑hash‑checks each start.
+- **Launcher** (`java -jar Guardio.jar`) — the strongest mode, and **host‑agnostic**: make Guardio the jar your
+  host launches and it runs *before* the server, so it can clean and **heal the whole tree including the server
+  jar itself** (download a clean copy from the official Purpur/Paper URL when it's infected, modified, or
+  missing), then runs the real server. It **forwards the host's own JVM flags + program args** (heap, GC,
+  `nogui`, …) and passes the console/stop through, so it drops into any panel (Pterodactyl, Multicraft, …) or
+  start script unchanged. Two ways to run the server (`launch-mode`): **in‑process** (same JVM — zero extra RAM,
+  one process; best for memory‑capped panels) with automatic fallback to a **subprocess** (separate JVM —
+  rock‑solid for any server software) if the server doesn't cooperate. Because it runs before any plugin, the
+  infector never executes during a guarded boot, so it can't tamper with Guardio mid‑run; it self‑hash‑checks
+  each start.
 - **Pre‑load agent** (`-javaagent`) — runs in `premain`, before any plugin loads, so jars are unlocked. This is
   the only true "before everything" hook (a `plugin.yml` can't guarantee it).
 - **Whole‑server scope** — the top‑level server jar + every jar under configurable roots (default `plugins` +
@@ -38,6 +43,15 @@ One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and 
    It then scans/heals the tree and launches + supervises the server. Do the first run on a **clean** install
    so the baseline is clean.
 
+**On a hosting panel (Pterodactyl, Multicraft, shared hosts, …):** the panel always runs *some* jar —
+point it at Guardio and Guardio launches the real server for you:
+- Put both jars in the server folder (the real server e.g. `paper.jar`, plus Guardio).
+- Make Guardio the launched jar — either **rename Guardio to the jar the panel runs** (often `server.jar`),
+  or set the panel's "jar file" / startup command to Guardio's jar.
+- Set `server-jar=` in `guardio.properties` to the real server jar (Guardio also auto‑detects it, skipping
+  itself). The panel's `-Xmx`/flags are forwarded automatically; `launch-mode=in-process` keeps it to one
+  process so the panel's memory cap and console behave normally.
+
 **Or agent‑only mode** (guards plugins + libraries, detects the server jar but can't heal it live):
 ```
 java -Xmx4G -javaagent:plugins/PluginGuard-1.0.0.jar -jar paper.jar nogui
@@ -55,8 +69,11 @@ trust all` forces it).
 - `/guard heal` — download clean replacements for quarantined plugins
 
 ## Config
-`config.yml` — scan roots, signatures, auto‑map/quarantine/restore/download, whitelist, shutdown‑on‑infection.
-`sources.yml` — download overrides (`modrinth:<slug>` / `url:<jar>` / `github:<owner/repo>`).
+`guardio.properties` (launcher, in the server root, auto‑created) — `server-jar`, `server-jar-url`,
+`launch-mode` (`auto`/`in-process`/`subprocess`), `java-args`/`server-args` (fallback only — the host's own
+flags are forwarded), `use-agent`, `restart-on-crash`, `restart-flag`, `scan-roots`.
+`config.yml` (plugin) — scan roots, signatures, auto‑map/quarantine/restore/download, whitelist, shutdown‑on‑infection.
+`sources.yml` (plugin) — download overrides (`modrinth:<slug>` / `url:<jar>` / `github:<owner/repo>`).
 
 ## Testing
 `test-virus/` is a **harmless** test plugin: it carries a fake signature (a benign `javassist.ws.Marker`

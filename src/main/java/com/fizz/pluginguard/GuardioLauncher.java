@@ -6,7 +6,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
 import java.net.URI;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -19,6 +22,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.jar.JarFile;
 
 /**
  * Guardio launcher - the "more than a plugin" mode. Run it INSTEAD of the server jar:
@@ -52,7 +56,20 @@ public final class GuardioLauncher {
         File serverRoot = new File(".").getCanonicalFile();
         File guardFolder = new File(serverRoot, "plugins/PluginGuard");
         guardFolder.mkdirs();
-        Props cfg = Props.loadOrCreate(new File(serverRoot, "guardio.properties"));
+        File selfJar = ownJar();
+        Props cfg = Props.loadOrCreate(new File(serverRoot, "guardio.properties"),
+                selfJar == null ? "" : selfJar.getName());
+
+        // Resolve the REAL server jar: config wins, else auto-detect (excluding Guardio's own jar) so it works
+        // even when Guardio is the jar the host launches (e.g. renamed to server.jar).
+        if (cfg.get("server-jar", "").isBlank()) {
+            File self = ownJar();
+            String detected = Props.detectServerJar(serverRoot, self == null ? "" : self.getName());
+            if (detected != null) {
+                cfg.set("server-jar", detected);
+                banner("auto-detected server jar: " + detected);
+            }
+        }
 
         banner("Guardio launcher - guarding the whole server BEFORE it loads...");
         selfCheck(guardFolder);
@@ -62,7 +79,7 @@ public final class GuardioLauncher {
             banner("--scan-only: not launching the server.");
             return;
         }
-        System.exit(launchLoop(serverRoot, guardFolder, cfg));
+        System.exit(launchLoop(serverRoot, guardFolder, cfg, args));
     }
 
     // ---- self-protection -----------------------------------------------
@@ -209,56 +226,139 @@ public final class GuardioLauncher {
 
     // ---- launch + supervise --------------------------------------------
 
-    private static int launchLoop(File serverRoot, File guardFolder, Props cfg) throws Exception {
-        String serverJar = cfg.get("server-jar", "");
-        if (serverJar.isBlank()) {
-            logRed("no 'server-jar' set in guardio.properties - nothing to launch.");
+    private static int launchLoop(File serverRoot, File guardFolder, Props cfg, String[] mainArgs) throws Exception {
+        String serverJarName = cfg.get("server-jar", "");
+        if (serverJarName.isBlank()) {
+            logRed("no server jar found (set 'server-jar' in guardio.properties) - nothing to launch.");
             return 2;
         }
-        List<String> javaArgs = split(cfg.get("java-args", "-Xmx2G"));
-        List<String> serverArgs = split(cfg.get("server-args", "nogui"));
-        boolean useAgent = Boolean.parseBoolean(cfg.get("use-agent", "true"));
+        File realJar = new File(serverRoot, serverJarName);
+        String mode = cfg.get("launch-mode", "auto").trim().toLowerCase(Locale.ROOT);
         boolean restartOnCrash = Boolean.parseBoolean(cfg.get("restart-on-crash", "false"));
         String restartFlag = cfg.get("restart-flag", "");
-        File self = ownJar();
-        String javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
-                + (isWindows() ? ".exe" : "");
+        List<String> serverArgs = forwardServerArgs(mainArgs, cfg);
 
-        int code;
+        boolean subprocess = mode.equals("subprocess");
         while (true) {
-            List<String> cmd = new ArrayList<>();
-            cmd.add(javaBin);
-            cmd.addAll(javaArgs);
-            if (useAgent && self != null) {
-                cmd.add("-javaagent:" + self.getPath());
-            }
-            cmd.add("-jar");
-            cmd.add(serverJar);
-            cmd.addAll(serverArgs);
-            banner("launching server (Guardio supervising): " + serverJar);
-            Process proc = new ProcessBuilder(cmd).directory(serverRoot).inheritIO().start();
-            code = proc.waitFor();
-            banner("server exited (code " + code + ").");
-
-            boolean restart = false;
-            if (restartFlag != null && !restartFlag.isBlank()) {
-                File flag = new File(serverRoot, restartFlag);
-                if (flag.exists()) {
-                    flag.delete();
-                    restart = true;
-                    banner("restart flag '" + restartFlag + "' found - re-scanning, then relaunching...");
+            int code;
+            if (!subprocess) {
+                boolean ran = launchInProcess(realJar, serverArgs);
+                if (!ran) {
+                    if (mode.equals("in-process")) {
+                        logRed("in-process launch failed and fallback is disabled (launch-mode=in-process).");
+                        return 3;
+                    }
+                    logRed("in-process launch failed - falling back to a subprocess.");
+                    subprocess = true;
+                    continue; // retry this round as a subprocess
                 }
+                code = 0; // server ran in-process and returned
+            } else {
+                code = launchSubprocess(serverRoot, cfg, realJar, serverArgs);
             }
+
+            boolean restart = checkRestartFlag(serverRoot, restartFlag);
             if (!restart && restartOnCrash && code != 0) {
                 restart = true;
-                banner("server crashed (code " + code + ") - re-scanning, then relaunching...");
+                banner("server exited with code " + code + " - re-scanning, then relaunching...");
             }
             if (!restart) {
-                break;
+                return code;
             }
             scanAndHeal(serverRoot, guardFolder, cfg); // re-guard before every relaunch
         }
+    }
+
+    /** Loads the real server jar in THIS JVM and runs its Main-Class. Returns false if it failed to launch. */
+    private static boolean launchInProcess(File realJar, List<String> serverArgs) {
+        try {
+            String mainClass;
+            try (JarFile jf = new JarFile(realJar)) {
+                mainClass = jf.getManifest() == null ? null
+                        : jf.getManifest().getMainAttributes().getValue("Main-Class");
+            }
+            if (mainClass == null) {
+                logRed("the server jar has no Main-Class - can't launch in-process.");
+                return false;
+            }
+            banner("launching server in-process (" + mainClass + ", same JVM, no extra RAM)...");
+            URLClassLoader cl = new URLClassLoader(new URL[]{realJar.toURI().toURL()}, ClassLoader.getSystemClassLoader());
+            Thread.currentThread().setContextClassLoader(cl);
+            Class<?> m = Class.forName(mainClass, true, cl);
+            m.getMethod("main", String[].class).invoke(null, (Object) serverArgs.toArray(new String[0]));
+            return true; // server ran (and its main returned) — a normal stop
+        } catch (Throwable t) {
+            Throwable cause = (t.getCause() != null) ? t.getCause() : t;
+            logRed("in-process launch failed: " + cause.getClass().getSimpleName()
+                    + (cause.getMessage() != null ? " - " + cause.getMessage() : ""));
+            return false;
+        }
+    }
+
+    /** Re-runs the server as a child JVM, forwarding the host's JVM flags + the agent, with console + stop passthrough. */
+    private static int launchSubprocess(File serverRoot, Props cfg, File realJar, List<String> serverArgs) throws Exception {
+        String javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java"
+                + (isWindows() ? ".exe" : "");
+        List<String> hostJvm = ManagementFactory.getRuntimeMXBean().getInputArguments();
+        boolean hostHasHeap = hostJvm.stream().anyMatch(a -> a.startsWith("-Xmx"));
+        List<String> jvm = new ArrayList<>();
+        for (String a : hostJvm) {
+            if (!a.startsWith("-javaagent") && !a.startsWith("-agentlib") && !a.startsWith("-agentpath")) {
+                jvm.add(a); // forward the host's flags (heap, GC, etc.), minus agents
+            }
+        }
+        if (!hostHasHeap) {
+            jvm.addAll(split(cfg.get("java-args", "-Xmx2G"))); // host gave no heap → use config
+        }
+        File self = ownJar();
+        List<String> cmd = new ArrayList<>();
+        cmd.add(javaBin);
+        cmd.addAll(jvm);
+        if (Boolean.parseBoolean(cfg.get("use-agent", "true")) && self != null) {
+            cmd.add("-javaagent:" + self.getPath());
+        }
+        cmd.add("-jar");
+        cmd.add(realJar.getName());
+        cmd.addAll(serverArgs);
+        banner("launching server (subprocess): " + String.join(" ", cmd));
+        Process proc = new ProcessBuilder(cmd).directory(serverRoot).inheritIO().start();
+        Thread hook = new Thread(() -> {
+            if (proc.isAlive()) {
+                proc.destroy(); // panel/Ctrl-C stops Guardio → stop the child too
+            }
+        });
+        Runtime.getRuntime().addShutdownHook(hook);
+        int code = proc.waitFor();
+        try {
+            Runtime.getRuntime().removeShutdownHook(hook);
+        } catch (IllegalStateException ignored) {
+            // already shutting down
+        }
+        banner("server exited (code " + code + ").");
         return code;
+    }
+
+    /** Server args = the host's program args (minus our flags), or the config fallback. */
+    private static List<String> forwardServerArgs(String[] mainArgs, Props cfg) {
+        List<String> a = new ArrayList<>();
+        for (String s : mainArgs) {
+            if (!s.equals("--scan-only")) {
+                a.add(s);
+            }
+        }
+        return a.isEmpty() ? split(cfg.get("server-args", "nogui")) : a;
+    }
+
+    private static boolean checkRestartFlag(File serverRoot, String restartFlag) {
+        if (restartFlag != null && !restartFlag.isBlank()) {
+            File flag = new File(serverRoot, restartFlag);
+            if (flag.exists()) {
+                flag.delete();
+                banner("restart flag '" + restartFlag + "' found - re-scanning, then relaunching...");
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---- helpers --------------------------------------------------------
@@ -320,14 +420,14 @@ public final class GuardioLauncher {
     static final class Props {
         private final Properties p = new Properties();
 
-        static Props loadOrCreate(File f) throws IOException {
+        static Props loadOrCreate(File f, String selfName) throws IOException {
             Props pr = new Props();
             if (f.isFile()) {
                 try (InputStream in = new FileInputStream(f)) {
                     pr.p.load(in);
                 }
             } else {
-                pr.writeDefaults(f);
+                pr.writeDefaults(f, selfName);
             }
             return pr;
         }
@@ -336,9 +436,13 @@ public final class GuardioLauncher {
             return p.getProperty(k, d);
         }
 
-        private void writeDefaults(File f) throws IOException {
+        void set(String k, String v) {
+            p.setProperty(k, v);
+        }
+
+        private void writeDefaults(File f, String selfName) throws IOException {
             File root = f.getCanonicalFile().getParentFile();
-            String jar = detectServerJar(root);
+            String jar = detectServerJar(root, selfName);
             String ver = (jar == null) ? "" : jar.replaceAll("(?i).*?(\\d+\\.\\d+(?:\\.\\d+)?).*", "$1");
             String url = "";
             if (jar != null && jar.toLowerCase(Locale.ROOT).contains("purpur") && !ver.equals(jar)) {
@@ -346,6 +450,7 @@ public final class GuardioLauncher {
             }
             p.setProperty("server-jar", jar == null ? "" : jar);
             p.setProperty("server-jar-url", url);
+            p.setProperty("launch-mode", "auto");
             p.setProperty("java-args", "-Xmx2G -Xms2G");
             p.setProperty("server-args", "nogui");
             p.setProperty("use-agent", "true");
@@ -353,22 +458,26 @@ public final class GuardioLauncher {
             p.setProperty("restart-flag", "hyhandler.restart");
             p.setProperty("scan-roots", "plugins,libraries");
             try (OutputStream out = new FileOutputStream(f)) {
-                p.store(out, "Guardio launcher config. server-jar-url MUST point to the OFFICIAL clean server jar "
-                        + "(Purpur/Paper API). For Paper, set the full build download URL.");
+                p.store(out, "Guardio launcher config. launch-mode: auto|in-process|subprocess. server-jar-url MUST "
+                        + "point to the OFFICIAL clean server jar (Purpur/Paper API). java-args/server-args are used "
+                        + "only if the host passed none (the host's own JVM flags are forwarded automatically).");
             }
         }
 
-        private static String detectServerJar(File root) {
+        /** First server-looking jar in root, excluding Guardio itself (by exact name + guardio/pluginguard). */
+        static String detectServerJar(File root, String selfName) {
             File[] jars = root.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
             if (jars == null) {
                 return null;
             }
+            String self = selfName == null ? "" : selfName.toLowerCase(Locale.ROOT);
             for (File j : jars) {
                 String n = j.getName().toLowerCase(Locale.ROOT);
-                if (n.contains("guardio") || n.contains("pluginguard")) {
+                if (n.equals(self) || n.contains("guardio") || n.contains("pluginguard")) {
                     continue;
                 }
-                if (n.contains("purpur") || n.contains("paper") || n.contains("spigot") || n.contains("folia")) {
+                if (n.contains("purpur") || n.contains("paper") || n.contains("spigot")
+                        || n.contains("folia") || n.contains("server") || n.contains("fabric")) {
                     return j.getName();
                 }
             }
