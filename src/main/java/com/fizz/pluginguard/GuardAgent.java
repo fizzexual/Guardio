@@ -55,7 +55,7 @@ public final class GuardAgent {
             SelfIntegrity.Status selfSt = SelfIntegrity.check(guardFolder, true);
             if (selfSt == SelfIntegrity.Status.TAMPERED) {
                 logRed("SELF-INTEGRITY: Guardio's own jar changed since its baseline (possible tamper / injection).");
-                if ("refuse".equalsIgnoreCase(selfProtect(guardFolder))) {
+                if ("refuse".equalsIgnoreCase(prop(guardFolder, "self-protect", "warn"))) {
                     logRed("self-protect=refuse - refusing to start. Delete guardio/guardio.self if YOU updated Guardio.");
                     System.exit(3);
                 }
@@ -65,6 +65,7 @@ public final class GuardAgent {
             JarScanner scanner = new JarScanner(ENTRY_SIGS, CONTENT_SIGS);
             List<String> whitelist = Whitelist.load(guardFolder);
             List<String> roots = readRoots(guardFolder);
+            List<String> devPlugins = DevPlugins.parse(prop(guardFolder, "dev-plugins", ""));
             ThreatFeed feed = ThreatFeed.loadOrFetch(new File(guardFolder, "threat-feed.txt"), null); // launcher-cached
             List<File> jars = Roots.listJars(serverRoot, roots, guardFolder);
 
@@ -95,6 +96,23 @@ public final class GuardAgent {
                     if (sha != null && sha.equals(vault.hash(rel))) {
                         unchanged++;
                         continue; // matches the mapped safe copy
+                    }
+                    // Developer plugin the operator rebuilds themselves: re-baseline instead of reverting it,
+                    // as long as it carries no malware signature (a feed hit was already handled above).
+                    if (DevPlugins.matches(jar.getName(), devPlugins)) {
+                        List<String> dr = scanner.scan(jar);
+                        if (JarScanner.unreadableOnly(dr)) {
+                            continue; // transient read error - leave it for the next pass
+                        }
+                        if (dr.isEmpty()) {
+                            if (vault.trust(jar, rel)) {
+                                mapped++;
+                                report.add("DEV-REMAP " + rel);
+                                log("dev-plugin updated -> re-baselined: " + rel);
+                            }
+                            continue;
+                        }
+                        // else: the dev build actually tripped a signature - fall through and quarantine it.
                     }
                     if (quarantine(jar, rel, quarantine) && restore(vault, rel, jar)) {
                         restored++;
@@ -140,18 +158,18 @@ public final class GuardAgent {
         }
     }
 
-    private static String selfProtect(File guardFolder) {
+    private static String prop(File guardFolder, String key, String def) {
         File f = new File(guardFolder, "guardio.properties");
         if (f.isFile()) {
             try (InputStream in = new FileInputStream(f)) {
                 Properties p = new Properties();
                 p.load(in);
-                return p.getProperty("self-protect", "warn");
+                return p.getProperty(key, def);
             } catch (IOException ignored) {
                 // default below
             }
         }
-        return "warn";
+        return def;
     }
 
     private static List<String> readRoots(File guardFolder) {

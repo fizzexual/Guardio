@@ -86,6 +86,8 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     private String discordRole;
     private boolean discordEmbeds;
 
+    private List<String> devPlugins = List.of();
+
     private String updateStatus = "(checking)";
 
     private final List<Pending> pending = Collections.synchronizedList(new ArrayList<>());
@@ -138,9 +140,12 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
 
         this.discordEnabled = c.getBoolean("discord.enabled", false);
         String wh = c.getString("discord.webhook", "");
-        this.webhook = (wh == null || wh.isBlank()) ? launcherWebhook() : wh.trim();
+        this.webhook = (wh == null || wh.isBlank()) ? readProp("discord-webhook") : wh.trim();
         this.discordRole = c.getString("discord.mention-role-id", "");
         this.discordEmbeds = c.getBoolean("discord.embeds", true);
+        // Plugins the operator builds + rebuilds themselves; a change to one is re-baselined, not flagged.
+        // Single source = guardio.properties (the pure-JDK launcher/agent can't parse this YAML config).
+        this.devPlugins = DevPlugins.parse(readProp("dev-plugins"));
         // Self-integrity is enforced by the launcher + pre-load agent on the REAL jar (the plugin's own jar is
         // remapped by Paper, so a plugin-layer self-hash would false-positive). The launcher re-syncs the
         // plugins/ copy from the verified root each boot, so this layer doesn't need its own check.
@@ -321,13 +326,13 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         }
     }
 
-    private String launcherWebhook() {
+    private String readProp(String key) {
         File f = new File(home, "guardio.properties");
         if (f.isFile()) {
             try (InputStream in = new FileInputStream(f)) {
                 Properties p = new Properties();
                 p.load(in);
-                return p.getProperty("discord-webhook", "").trim();
+                return p.getProperty(key, "").trim();
             } catch (IOException ignored) {
                 // none
             }
@@ -415,6 +420,20 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
             boolean sigHit = feedHit || allowlistBlock
                     || (!sigReasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist));
             boolean hashMatch = inVault && sha != null && sha.equals(vault.hash(rel));
+
+            // Developer plugin the operator rebuilds themselves: a changed-but-signature-clean dev-plugin is
+            // re-baselined (vault updated to the new build) rather than flagged as infection. The malware layers
+            // (sigHit covers signature + threat-feed + allowlist) still gate this, so an actually-infected dev
+            // build is NOT silently trusted.
+            if (inVault && !hashMatch && !sigHit && DevPlugins.matches(jar.getName(), devPlugins)) {
+                if (remediate && vault.trust(jar, rel)) {
+                    getLogger().info("dev-plugin updated -> re-baselined: " + rel);
+                    if (discordAlert("restore")) {
+                        events.add("🔧 dev-plugin re-baselined: " + rel);
+                    }
+                }
+                hashMatch = true; // treat as trusted against the refreshed baseline (don't flag your own rebuild)
+            }
 
             ScanResult r = new ScanResult(jar, sha, sigHit, inVault, hashMatch, reasons);
             results.add(r);

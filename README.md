@@ -148,6 +148,12 @@ discord · signatures`), `guardio/messages.yml` (i18n), `guardio/guardio.propert
 
 ## 9. Boundary conditions (honest limits)
 
+**Developer mode.** Operators who compile their own plugins set `dev-plugins=NameA,NameB` in
+`guardio/guardio.properties` (jar‑name fragments). A change to a matching jar is **re‑baselined** (the vault is
+updated to the new build) instead of being quarantined or reverted — so a developer can iterate while Guardio
+stays fully armed against everything else. The malware layers (signature, threat‑feed) still gate it: a
+dev‑plugin that actually trips one is still quarantined. Only list jars you build yourself.
+
 Guardio enforces integrity of the **server tree**; it is **not** a host‑level EDR. OS‑resident persistence,
 exfiltrated credentials, or a trojanized OS/JRE are out of scope — a compromised host requires OS remediation
 and credential rotation independent of Guardio. Premium artifacts without a free distribution channel cannot be

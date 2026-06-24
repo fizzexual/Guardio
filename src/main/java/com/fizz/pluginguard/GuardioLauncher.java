@@ -288,6 +288,7 @@ public final class GuardioLauncher {
         String serverJarUrl = cfg.get("server-jar-url", "");
         ThreatFeed feed = ThreatFeed.loadOrFetch(new File(guardFolder, "threat-feed.txt"), cfg.get("threat-feed-url", ""));
         boolean heuristics = Boolean.parseBoolean(cfg.get("heuristics", "true"));
+        List<String> devPlugins = DevPlugins.parse(cfg.get("dev-plugins", ""));
         String webhook = cfg.get("discord-webhook", "");
         String serverName = serverName(cfg, serverRoot);
 
@@ -358,6 +359,23 @@ public final class GuardioLauncher {
             if (vault.has(rel)) {
                 if (sha != null && sha.equals(vault.hash(rel))) {
                     continue;
+                }
+                // Developer plugin the operator rebuilds themselves: update the baseline instead of reverting
+                // it, as long as it carries no malware signature (a feed hit was already handled above).
+                if (DevPlugins.matches(jar.getName(), devPlugins)) {
+                    List<String> dr = scanner.scan(jar);
+                    if (JarScanner.unreadableOnly(dr)) {
+                        logRed("could not read dev-plugin " + rel + " - skipped this scan");
+                        continue;
+                    }
+                    if (dr.isEmpty()) {
+                        vault.trust(jar, rel);
+                        mapped++;
+                        events.add("🔧 dev-plugin `" + rel + "` updated -> re-baselined");
+                        logGrn("dev-plugin updated -> re-baselined: " + rel);
+                        continue;
+                    }
+                    // else: the dev build actually tripped a signature - fall through and quarantine it.
                 }
                 if (quarantineFile(jar, rel, quarantine) && copy(vault.file(rel), jar)) {
                     restored++;
@@ -770,6 +788,7 @@ public final class GuardioLauncher {
             p.setProperty("threat-feed-url", "");
             p.setProperty("heuristics", "true");
             p.setProperty("self-protect", "warn"); // off | warn | refuse - refuse aborts if Guardio's jar was tampered
+            p.setProperty("dev-plugins", ""); // jars YOU build+rebuild, e.g. Hyblock,HyData - re-baselined on change
             try (OutputStream out = new FileOutputStream(f)) {
                 p.store(out, "Guardio launcher config. launch-mode: auto|in-process|subprocess. server-jar-url MUST "
                         + "point to the OFFICIAL clean server jar (Purpur/Paper API). java-args/server-args are used "
