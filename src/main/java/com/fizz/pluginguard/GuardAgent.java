@@ -53,6 +53,7 @@ public final class GuardAgent {
             JarScanner scanner = new JarScanner(ENTRY_SIGS, CONTENT_SIGS);
             List<String> whitelist = Whitelist.load(guardFolder);
             List<String> roots = readRoots(guardFolder);
+            ThreatFeed feed = ThreatFeed.loadOrFetch(new File(guardFolder, "threat-feed.txt"), null); // launcher-cached
             List<File> jars = Roots.listJars(serverRoot, roots, guardFolder);
 
             List<String> report = new ArrayList<>();
@@ -80,15 +81,18 @@ public final class GuardAgent {
                     }
                 } else {
                     List<String> reasons = scanner.scan(jar);
-                    if (!reasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist)) {
+                    boolean sig = !reasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist);
+                    boolean feedHit = feed.contains(sha);
+                    if (sig || feedHit) {
+                        String why = sig ? String.join("; ", reasons) : "known-malware hash (threat feed)";
                         if (quarantine(jar, rel, quarantine)) {
                             blocked++;
-                            report.add("BLOCKED " + rel + " :: " + String.join("; ", reasons));
-                            logRed("BLOCKED infected jar " + rel + " -> " + String.join("; ", reasons));
+                            report.add("BLOCKED " + rel + " :: " + why);
+                            logRed("BLOCKED infected jar " + rel + " -> " + why);
                         } else {
                             lockedInfected = rel; // can't remove it (running server jar) -> abort below
-                            report.add("LOCKED-INFECTED " + rel + " :: " + String.join("; ", reasons));
-                            logRed("CANNOT remove infected (locked) jar: " + rel + " -> " + String.join("; ", reasons));
+                            report.add("LOCKED-INFECTED " + rel + " :: " + why);
+                            logRed("CANNOT remove infected (locked) jar: " + rel + " -> " + why);
                         }
                     } else if (vault.trust(jar, rel)) {
                         mapped++;

@@ -59,6 +59,10 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     private Healer healer;
     private Map<String, String> sources;
     private String gameVersion;
+    private ThreatFeed threatFeed;
+    private String webhook;
+    private String serverName;
+    private boolean heuristicsOn;
 
     private final List<Pending> pending = new ArrayList<>();
     private List<ScanResult> lastResults = new ArrayList<>();
@@ -90,6 +94,11 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
         this.sources = loadSources();
         String gv = c.getString("download-game-version", "");
         this.gameVersion = (gv == null || gv.isBlank()) ? Bukkit.getBukkitVersion().split("-")[0] : gv.trim();
+        this.webhook = c.getString("discord-webhook", "");
+        String sn = c.getString("server-name", "");
+        this.serverName = (sn == null || sn.isBlank()) ? serverRoot.getName() : sn;
+        this.heuristicsOn = c.getBoolean("heuristics", true);
+        this.threatFeed = ThreatFeed.loadOrFetch(new File(home, "threat-feed.txt"), c.getString("threat-feed-url", ""));
 
         Runtime.getRuntime().addShutdownHook(new Thread(this::applyPending, "Guardio-remediate"));
 
@@ -175,11 +184,18 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
 
     private List<ScanResult> runScan(boolean remediate) {
         List<ScanResult> results = new ArrayList<>();
+        List<String> events = new ArrayList<>(); // for the Discord summary
         for (File jar : Roots.listJars(serverRoot, roots, home)) {
             String rel = Vault.rel(serverRoot, jar);
             String sha = Hashing.sha256(jar);
-            List<String> reasons = scanner.scan(jar);
-            boolean sigHit = !reasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist);
+            List<String> sigReasons = scanner.scan(jar);
+            boolean feedHit = threatFeed != null && threatFeed.contains(sha);
+            List<String> reasons = new ArrayList<>(sigReasons);
+            if (feedHit) {
+                reasons.add("known-malware hash (threat feed)");
+            }
+            // a feed hit is definitive (whitelist can't suppress a known-malware hash)
+            boolean sigHit = feedHit || (!sigReasons.isEmpty() && !Whitelist.allows(jar.getName(), whitelist));
             boolean inVault = vault.has(rel);
             boolean hashMatch = inVault && sha != null && sha.equals(vault.hash(rel));
             ScanResult r = new ScanResult(jar, sha, sigHit, inVault, hashMatch, reasons);
@@ -189,6 +205,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                 infectionAtBoot = true;
                 String what = sigHit ? String.join("; ", reasons) : "integrity: hash differs from trusted vault copy";
                 getLogger().severe("INFECTED: " + rel + "  ->  " + what);
+                events.add("🛑 INFECTED `" + rel + "` :: " + what);
                 if (remediate && autoQuarantine) {
                     stageRemediation(jar, rel);
                 }
@@ -196,10 +213,32 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                 if (vault.trust(jar, rel)) {
                     getLogger().info("mapped new jar into vault baseline: " + rel);
                 }
+                if (heuristicsOn && rel.startsWith("plugins")) { // report-only, plugins only (not vetted libraries)
+                    List<String> sus = Heuristics.analyze(jar);
+                    if (!sus.isEmpty()) {
+                        getLogger().warning("SUSPICIOUS (report-only, NOT quarantined): " + rel
+                                + "  ->  " + String.join("; ", sus));
+                        events.add("⚠️ suspicious (report-only) `" + rel + "` :: " + String.join("; ", sus));
+                    }
+                }
             }
         }
         writeReport(results);
+        notify("scan", events);
         return results;
+    }
+
+    /** Posts a Discord summary if a webhook is set (async when enabled; sync at onLoad before the scheduler exists). */
+    private void notify(String context, List<String> events) {
+        if (webhook == null || webhook.isBlank() || events.isEmpty()) {
+            return;
+        }
+        String msg = "**Guardio / " + serverName + "** (" + context + "):\n" + String.join("\n", events);
+        if (isEnabled()) {
+            Bukkit.getScheduler().runTaskAsynchronously(this, () -> Notifier.send(webhook, msg));
+        } else {
+            Notifier.send(webhook, msg);
+        }
     }
 
     /** Queues a quarantine (+ restore if the vault has a clean copy) to run when jars unlock at shutdown. */
@@ -263,8 +302,30 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                 continue; // already healed / restored elsewhere
             }
             String[] info = readPluginInfo(qf);
+            String pluginName = info != null ? info[0] : null;
+
+            // (a) Trusted backup first — covers premium plugins with no free download source.
+            File trusted = TrustedBackups.find(home, pluginName, new File(rel).getName(), scanner);
+            if (trusted != null) {
+                try {
+                    File p = dest.getParentFile();
+                    if (p != null) {
+                        p.mkdirs();
+                    }
+                    Files.copy(trusted.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    vault.trust(dest, rel);
+                    healed++;
+                    report.add("HEALED " + rel + "  <-  trusted/" + trusted.getName());
+                    getLogger().info("healed " + rel + " from trusted backup " + trusted.getName());
+                    continue;
+                } catch (IOException ex) {
+                    // fall through to a free download
+                }
+            }
+
+            // (b) Free download (Modrinth / sources.yml override).
             if (info == null) {
-                report.add("skip (no plugin.yml / library): " + rel);
+                report.add("skip (no plugin.yml / library; add a copy to guardio/trusted/): " + rel);
                 continue;
             }
             String name = info[0];
@@ -297,6 +358,9 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                 Files.write(new File(home, "heal-report.txt").toPath(), report);
             } catch (IOException ignored) {
                 // non-fatal
+            }
+            if (webhook != null && !webhook.isBlank()) { // already off the main thread (heal runs async)
+                Notifier.send(webhook, "**Guardio / " + serverName + "** (auto-heal):\n" + String.join("\n", report));
             }
         }
         final int h = healed;

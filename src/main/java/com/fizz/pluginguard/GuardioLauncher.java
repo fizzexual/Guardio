@@ -179,18 +179,23 @@ public final class GuardioLauncher {
         List<String> roots = Arrays.asList(cfg.get("scan-roots", "plugins,libraries").trim().split("\\s*,\\s*"));
         String serverJarName = cfg.get("server-jar", "");
         String serverJarUrl = cfg.get("server-jar-url", "");
+        ThreatFeed feed = ThreatFeed.loadOrFetch(new File(guardFolder, "threat-feed.txt"), cfg.get("threat-feed-url", ""));
+        boolean heuristics = Boolean.parseBoolean(cfg.get("heuristics", "true"));
+        String webhook = cfg.get("discord-webhook", "");
+        String serverName = serverName(cfg, serverRoot);
 
         int healed = 0;
         int blocked = 0;
         int restored = 0;
         int mapped = 0;
+        List<String> events = new ArrayList<>(); // collected for one Discord summary
 
-        // 1) The server jar - heal it (download a clean copy) if infected or missing.
+        // 1) The server jar - heal it (download a clean copy) if missing / infected (signature or threat-feed) / tampered.
         File serverJar = serverJarName.isBlank() ? null : new File(serverRoot, serverJarName);
         if (serverJar != null) {
             String sha = Hashing.sha256(serverJar);
             boolean missing = !serverJar.isFile();
-            boolean infected = !missing && !scanner.scan(serverJar).isEmpty();
+            boolean infected = !missing && (!scanner.scan(serverJar).isEmpty() || feed.contains(sha));
             boolean tampered = !missing && vault.has(serverJarName)
                     && (sha == null || !sha.equals(vault.hash(serverJarName)));
             if (missing || infected || tampered) {
@@ -200,10 +205,13 @@ public final class GuardioLauncher {
                 if (downloadVerify(serverJarUrl, serverJar, scanner, quarantine, serverJarName)) {
                     vault.trust(serverJar, serverJarName);
                     healed++;
+                    events.add("✅ healed server jar `" + serverJarName + "` from the official source");
                     logGrn("healed server jar from " + serverJarUrl);
                 } else {
                     logRed("FAILED to heal the server jar - set a correct 'server-jar-url' in guardio.properties. "
                             + "Refusing to launch a missing/infected server jar.");
+                    Notifier.send(webhook, "🛑 **Guardio / " + serverName + "**: server jar `"
+                            + serverJarName + "` is bad and could not be healed - refusing to start.");
                     System.exit(2);
                 }
             } else if (!vault.has(serverJarName)) {
@@ -212,7 +220,7 @@ public final class GuardioLauncher {
             }
         }
 
-        // 2) plugins + libraries - quarantine infected, restore changed-from-vault, map new clean.
+        // 2) plugins + libraries - quarantine infected, restore changed-from-vault / from trusted backup, map new clean.
         for (File jar : Roots.listJars(serverRoot, roots, guardFolder)) {
             if (serverJar != null && jar.getAbsoluteFile().equals(serverJar.getAbsoluteFile())) {
                 continue;
@@ -225,19 +233,52 @@ public final class GuardioLauncher {
                 }
                 if (quarantineFile(jar, rel, quarantine) && copy(vault.file(rel), jar)) {
                     restored++;
+                    events.add("♻️ restored `" + rel + "` (differed from the trusted copy)");
                     logRed("restored " + rel + " (differed from mapped copy)");
                 }
-            } else if (!scanner.scan(jar).isEmpty()) {
-                if (quarantineFile(jar, rel, quarantine)) {
-                    blocked++;
-                    logRed("quarantined infected " + rel + " (the in-server plugin will try to auto-download a clean copy)");
+            } else {
+                List<String> sigReasons = scanner.scan(jar);
+                boolean infected = !sigReasons.isEmpty() || feed.contains(sha);
+                if (infected) {
+                    String why = !sigReasons.isEmpty() ? String.join("; ", sigReasons) : "known-malware hash (threat feed)";
+                    File trusted = TrustedBackups.find(guardFolder, null, jar.getName(), scanner);
+                    if (trusted != null && quarantineFile(jar, rel, quarantine) && copy(trusted, jar)) {
+                        vault.trust(jar, rel);
+                        restored++;
+                        events.add("♻️ restored infected `" + rel + "` from a trusted/ backup");
+                        logGrn("restored infected " + rel + " from a trusted backup");
+                    } else if (quarantineFile(jar, rel, quarantine)) {
+                        blocked++;
+                        events.add("🛑 quarantined infected `" + rel + "` :: " + why);
+                        logRed("quarantined infected " + rel + " :: " + why
+                                + " (the in-server plugin will try to auto-download a clean copy)");
+                    }
+                } else if (vault.trust(jar, rel)) {
+                    mapped++;
+                    if (heuristics && rel.startsWith("plugins")) { // report-only, and only for plugins (not vetted libraries)
+                        List<String> sus = Heuristics.analyze(jar);
+                        if (!sus.isEmpty()) {
+                            events.add("⚠️ suspicious (report-only) `" + rel + "` :: " + String.join("; ", sus));
+                            logRed("SUSPICIOUS (report-only, NOT quarantined) " + rel + " :: " + String.join("; ", sus));
+                        }
+                    }
                 }
-            } else if (vault.trust(jar, rel)) {
-                mapped++;
             }
         }
-        banner("scan/heal done: server-jar-healed=" + healed + ", blocked=" + blocked
-                + ", restored=" + restored + ", mapped=" + mapped + ", vault=" + vault.size());
+        banner("scan/heal done: server-jar-healed=" + healed + ", blocked=" + blocked + ", restored=" + restored
+                + ", mapped=" + mapped + ", vault=" + vault.size() + ", threat-feed=" + feed.size());
+        if (!events.isEmpty()) {
+            Notifier.send(webhook, "**Guardio / " + serverName + "** (pre-boot scan):\n" + String.join("\n", events));
+        }
+    }
+
+    private static String serverName(Props cfg, File serverRoot) {
+        String n = cfg.get("server-name", "");
+        if (n != null && !n.isBlank()) {
+            return n;
+        }
+        String f = serverRoot.getName();
+        return (f == null || f.isBlank()) ? "server" : f;
     }
 
     /** Downloads {@code url} to {@code dest}, verifying it's clean (re-scan) and quarantining the old file. */
@@ -550,10 +591,16 @@ public final class GuardioLauncher {
             p.setProperty("restart-on-crash", "false");
             p.setProperty("restart-flag", "hyhandler.restart");
             p.setProperty("scan-roots", "plugins,libraries");
+            p.setProperty("discord-webhook", "");
+            p.setProperty("server-name", "");
+            p.setProperty("threat-feed-url", "");
+            p.setProperty("heuristics", "true");
             try (OutputStream out = new FileOutputStream(f)) {
                 p.store(out, "Guardio launcher config. launch-mode: auto|in-process|subprocess. server-jar-url MUST "
                         + "point to the OFFICIAL clean server jar (Purpur/Paper API). java-args/server-args are used "
-                        + "only if the host passed none (the host's own JVM flags are forwarded automatically).");
+                        + "only if the host passed none (the host's own JVM flags are forwarded automatically). "
+                        + "discord-webhook: alerts on quarantine/heal. threat-feed-url: known-malware SHA-256 list. "
+                        + "heuristics: report-only backdoor-pattern flagging.");
             }
         }
 
