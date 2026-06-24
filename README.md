@@ -59,8 +59,8 @@ Guardio owns a clean, self-contained tree:
 1. Put `guardio-v1.0.0.jar` in the server root, and your server jar in the root too (Guardio moves it into
    `guardio/serverjar/`), or place it directly in `guardio/serverjar/`.
 2. Start it, any of:
-   - **Double-click `guardio-v1.0.0.jar`** — Guardio opens a console window and runs the server (it writes a
-     `guardio-run.bat` helper the first time; heap comes from `java-args` in `guardio/guardio.properties`).
+   - **Double-click `guardio-v1.0.0.jar`** — Guardio opens a console window and runs the server in it (nothing
+     extra is written to your folder; heap comes from `java-args` in `guardio/guardio.properties`).
    - **Command line:** `java -Xmx4G -jar guardio-v1.0.0.jar` (put `-Xmx`/flags on the Guardio command — it forwards them).
 3. First run creates `guardio/` (config + vault), moves the server jar into `guardio/serverjar/`, drops a synced
    plugin copy in `plugins/`, scans/heals the whole tree, then launches + supervises the server. Do the first

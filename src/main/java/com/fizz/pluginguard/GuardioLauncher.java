@@ -556,26 +556,20 @@ public final class GuardioLauncher {
         }
     }
 
-    /** Reopens Guardio in a visible console window (via a small launch .bat) so a double-click gives an
-     *  interactive server. Returns false if it couldn't, so the caller can fall back to a (blind) run. */
+    /** Reopens Guardio in a visible console window so a double-click of the jar gives an interactive server.
+     *  Spawns a console directly (no helper file is written). Returns false on failure so the caller can fall
+     *  back to a (blind) run. */
     private static boolean reopenInConsole(File self, File serverRoot) {
         if (self == null) {
             return false;
         }
         try {
-            File bat = new File(serverRoot, "guardio-run.bat");
-            if (!bat.isFile()) {
-                String javaExe = System.getProperty("java.home") + "\\bin\\java.exe";
-                String c = "@echo off\r\n"
-                        + "cd /d \"%~dp0\"\r\n"
-                        + "\"" + javaExe + "\" -jar \"" + self.getName() + "\"\r\n"
-                        + "echo.\r\n"
-                        + "echo Server stopped. Press any key to close.\r\n"
-                        + "pause >nul\r\n";
-                Files.writeString(bat.toPath(), c);
-            }
-            // open a new console window running the .bat (it cd's to its own folder, then runs Guardio)
-            new ProcessBuilder("cmd", "/c", "start", "Guardio Server", bat.getPath()).start();
+            String javaExe = System.getProperty("java.home") + "\\bin\\java.exe";
+            // Open a new console and run Guardio in it directly (no helper file). Each path is its own arg, so
+            // there's no nested-quote parsing. The relaunched java uses java.exe (not javaw), so it won't loop.
+            new ProcessBuilder("cmd", "/c", "start", "Guardio Server", "/D", serverRoot.getPath(),
+                    javaExe, "-jar", self.getPath())
+                    .directory(serverRoot).start();
             return true;
         } catch (Exception ex) {
             return false;
