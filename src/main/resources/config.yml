@@ -17,6 +17,9 @@ general:
   alert-ops: true
   # Check for a newer Guardio release on startup (logs only; never auto-downloads).
   update-check: true
+  # Self-tamper protection: off | warn | refuse. 'refuse' stops the server if Guardio's OWN jar changed since
+  # its baseline (catches the infector injecting into Guardio). After a legit update, delete guardio/guardio.self.
+  self-protect: warn
 
 scanning:
   # Folders (relative to the server root) scanned recursively. The server jar is always guarded.

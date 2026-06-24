@@ -88,7 +88,7 @@ public final class GuardioLauncher {
         }
 
         banner("Guardio launcher - guarding the whole server BEFORE it loads...");
-        selfCheck(guardFolder);
+        selfCheck(guardFolder, cfg);
         ensurePluginCopy(serverRoot, selfJar); // keep a synced copy in plugins/ so the in-server plugin loads
         safeMode(serverRoot, guardFolder);     // hold/restore un-verified plugins if guardio.safemode is set
         scanAndHeal(serverRoot, guardFolder, cfg);
@@ -152,7 +152,7 @@ public final class GuardioLauncher {
                 }
             }
             logRed("SAFE MODE: held " + n + " un-verified plugin(s) in guardio/safemode-held/"
-                    + (failed > 0 ? " (" + failed + " could NOT be held — see above)" : "")
+                    + (failed > 0 ? " (" + failed + " could NOT be held - see above)" : "")
                     + ". Only vault-verified plugins will load. Delete 'guardio.safemode' to restore them.");
         } else if (held.isDirectory()) {
             List<File> jars = new ArrayList<>();
@@ -164,9 +164,9 @@ public final class GuardioLauncher {
                 if (dest.isFile()) {
                     String dh = Hashing.sha256(dest);
                     String hh = Hashing.sha256(jar);
-                    if (dh != null && !dh.equals(hh)) { // a different jar now sits there — don't clobber the newer one
+                    if (dh != null && !dh.equals(hh)) { // a different jar now sits there - don't clobber the newer one
                         logRed("safe-mode restore: " + Vault.rel(held, jar) + " was changed in plugins/ since it was "
-                                + "held — NOT overwriting (the held copy stays in safemode-held/).");
+                                + "held - NOT overwriting (the held copy stays in safemode-held/).");
                         skipped++;
                         continue;
                     }
@@ -249,27 +249,24 @@ public final class GuardioLauncher {
 
     // ---- self-protection -----------------------------------------------
 
-    private static void selfCheck(File guardFolder) {
-        try {
-            File self = ownJar();
-            if (self == null) {
-                return;
-            }
-            String h = Hashing.sha256(self);
-            File f = new File(guardFolder, "guardio.self");
-            if (f.isFile() && h != null) {
-                String prev = Files.readString(f.toPath()).trim();
-                if (!h.equals(prev)) {
-                    logRed("WARNING: Guardio's own jar changed since last run (possible tamper). "
-                            + "If you didn't update it, re-download Guardio from a trusted source.");
-                }
-            }
-            if (h != null) {
-                Files.writeString(f.toPath(), h);
-            }
-        } catch (Exception ignored) {
-            // self-check is best-effort
+    private static void selfCheck(File guardFolder, Props cfg) {
+        String mode = cfg.get("self-protect", "warn").trim().toLowerCase(Locale.ROOT);
+        SelfIntegrity.Status st = SelfIntegrity.check(guardFolder, true); // the launcher establishes the baseline
+        if (st != SelfIntegrity.Status.TAMPERED) {
+            return;
         }
+        logRed("SELF-INTEGRITY: Guardio's own jar changed since the recorded baseline (possible tamper / injection).");
+        Notifier.send(cfg.get("discord-webhook", ""), "🛑 **Guardio / " + serverName(cfg, guardFolder.getParentFile())
+                + "**: the Guardio jar changed since its baseline (possible tamper).");
+        if (mode.equals("refuse")) {
+            logRed("self-protect=refuse - refusing to start. If YOU updated Guardio, delete guardio/guardio.self "
+                    + "to accept the new build; otherwise re-download Guardio from a trusted source.");
+            System.exit(3);
+        }
+        if (!mode.equals("off")) {
+            logRed("(self-protect=warn) accepting this change + re-baselining. Set self-protect=refuse to harden.");
+        }
+        SelfIntegrity.rebaseline(guardFolder); // warn/off: accept the change so legit updates aren't sticky
     }
 
     private static File ownJar() {
@@ -307,7 +304,7 @@ public final class GuardioLauncher {
             boolean missing = !serverJar.isFile();
             List<String> sr = missing ? List.of() : scanner.scan(serverJar);
             if (!missing && JarScanner.unreadableOnly(sr)) {
-                // transient read error — do NOT treat a clean server jar as infected + replace it.
+                // transient read error - do NOT treat a clean server jar as infected + replace it.
                 logRed("server jar " + serverJarName + " could not be read (" + sr.get(0) + ") - skipping heal this boot.");
             } else {
                 boolean infected = !missing && (!sr.isEmpty() || feed.contains(sha));
@@ -548,7 +545,7 @@ public final class GuardioLauncher {
         }
         banner("launching server in-process (" + mainClass + ", same JVM, no extra RAM)...");
         // try-with-resources: close the classloader after main returns (a normal stop) so the jar handle is
-        // released — otherwise a later restart can't replace it on Windows, and the loader leaks per restart.
+        // released - otherwise a later restart can't replace it on Windows, and the loader leaks per restart.
         try (URLClassLoader cl = new URLClassLoader(new URL[]{realJar.toURI().toURL()}, ClassLoader.getSystemClassLoader())) {
             Thread.currentThread().setContextClassLoader(cl);
             Class<?> m = Class.forName(mainClass, true, cl);
@@ -593,7 +590,7 @@ public final class GuardioLauncher {
         Thread hook = new Thread(() -> {
             if (proc.isAlive()) {
                 // Ask the server to stop GRACEFULLY first (so it saves chunks/player data), then force-kill if
-                // it doesn't exit in time — avoids world corruption on a panel stop / Ctrl-C.
+                // it doesn't exit in time - avoids world corruption on a panel stop / Ctrl-C.
                 proc.destroy();
                 try {
                     if (!proc.waitFor(25, java.util.concurrent.TimeUnit.SECONDS)) {
@@ -772,6 +769,7 @@ public final class GuardioLauncher {
             p.setProperty("server-name", "");
             p.setProperty("threat-feed-url", "");
             p.setProperty("heuristics", "true");
+            p.setProperty("self-protect", "warn"); // off | warn | refuse - refuse aborts if Guardio's jar was tampered
             try (OutputStream out = new FileOutputStream(f)) {
                 p.store(out, "Guardio launcher config. launch-mode: auto|in-process|subprocess. server-jar-url MUST "
                         + "point to the OFFICIAL clean server jar (Purpur/Paper API). java-args/server-args are used "

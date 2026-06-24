@@ -1,12 +1,15 @@
 package com.fizz.pluginguard;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.instrument.Instrumentation;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Properties;
 
 /**
  * Pre-load Java agent - runs in {@code premain()} BEFORE the server loads, so the whole server tree (plugins,
@@ -49,6 +52,14 @@ public final class GuardAgent {
             File serverRoot = ((args != null && !args.isBlank()) ? new File(args.trim()) : new File("."))
                     .getAbsoluteFile();
             File guardFolder = new File(serverRoot, "guardio");
+            SelfIntegrity.Status selfSt = SelfIntegrity.check(guardFolder, true);
+            if (selfSt == SelfIntegrity.Status.TAMPERED) {
+                logRed("SELF-INTEGRITY: Guardio's own jar changed since its baseline (possible tamper / injection).");
+                if ("refuse".equalsIgnoreCase(selfProtect(guardFolder))) {
+                    logRed("self-protect=refuse - refusing to start. Delete guardio/guardio.self if YOU updated Guardio.");
+                    System.exit(3);
+                }
+            }
             File quarantine = new File(guardFolder, "quarantine");
             Vault vault = new Vault(guardFolder);
             JarScanner scanner = new JarScanner(ENTRY_SIGS, CONTENT_SIGS);
@@ -127,6 +138,20 @@ public final class GuardAgent {
         } catch (Throwable t) {
             logRed("error during pre-load scan: " + t);
         }
+    }
+
+    private static String selfProtect(File guardFolder) {
+        File f = new File(guardFolder, "guardio.properties");
+        if (f.isFile()) {
+            try (InputStream in = new FileInputStream(f)) {
+                Properties p = new Properties();
+                p.load(in);
+                return p.getProperty("self-protect", "warn");
+            } catch (IOException ignored) {
+                // default below
+            }
+        }
+        return "warn";
     }
 
     private static List<String> readRoots(File guardFolder) {

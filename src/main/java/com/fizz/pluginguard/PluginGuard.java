@@ -86,6 +86,9 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     private String discordRole;
     private boolean discordEmbeds;
 
+    private boolean selfTampered;
+    private String selfProtect;
+
     private String updateStatus = "(checking)";
 
     private final List<Pending> pending = Collections.synchronizedList(new ArrayList<>());
@@ -142,6 +145,9 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         this.discordRole = c.getString("discord.mention-role-id", "");
         this.discordEmbeds = c.getBoolean("discord.embeds", true);
 
+        this.selfProtect = c.getString("general.self-protect", "warn");
+        this.selfTampered = SelfIntegrity.check(home, false) == SelfIntegrity.Status.TAMPERED;
+
         this.scanExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Guardio-scan");
             t.setDaemon(true);
@@ -170,6 +176,15 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
         for (String line : msg.list("banner", "version", version(), "vault", vault.size(),
                 "launcher", launcherActive(), "agent", agentActive())) {
             Bukkit.getConsoleSender().sendMessage(line);
+        }
+        if (selfTampered) {
+            getLogger().severe("SELF-INTEGRITY: Guardio's own jar changed since its baseline (possible tamper / injection).");
+            notify("self-integrity", List.of("🛑 Guardio's own jar changed since baseline (possible tamper) on " + serverName));
+            if ("refuse".equalsIgnoreCase(selfProtect)) {
+                getLogger().severe("self-protect=refuse — stopping the server. Delete guardio/guardio.self if YOU updated Guardio.");
+                Bukkit.shutdown();
+                return;
+            }
         }
         int infected = count(ScanResult.Verdict.INFECTED);
         getLogger().info("Active. Vault baseline: " + vault.size() + " jar(s). Last scan: "
