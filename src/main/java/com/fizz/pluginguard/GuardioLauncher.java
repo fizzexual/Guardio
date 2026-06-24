@@ -238,6 +238,21 @@ public final class GuardioLauncher {
             }
             String rel = Vault.rel(serverRoot, jar);
             String sha = Hashing.sha256(jar);
+            if (feed.contains(sha)) {
+                // a known-malware hash is authoritative — quarantine even if this jar was previously mapped/trusted
+                File trusted = TrustedBackups.find(guardFolder, null, jar.getName(), scanner);
+                if (trusted != null && quarantineFile(jar, rel, quarantine) && copy(trusted, jar)) {
+                    vault.trust(jar, rel);
+                    restored++;
+                    events.add("♻️ restored `" + rel + "` from a trusted/ backup (was a known-malware hash)");
+                    logGrn("restored " + rel + " from a trusted backup (known-malware hash)");
+                } else if (quarantineFile(jar, rel, quarantine)) {
+                    blocked++;
+                    events.add("🛑 quarantined `" + rel + "` :: known-malware hash (threat feed)");
+                    logRed("quarantined " + rel + " :: known-malware hash (threat feed)");
+                }
+                continue;
+            }
             if (vault.has(rel)) {
                 if (sha != null && sha.equals(vault.hash(rel))) {
                     continue;
@@ -249,9 +264,9 @@ public final class GuardioLauncher {
                 }
             } else {
                 List<String> sigReasons = scanner.scan(jar);
-                boolean infected = !sigReasons.isEmpty() || feed.contains(sha);
+                boolean infected = !sigReasons.isEmpty();
                 if (infected) {
-                    String why = !sigReasons.isEmpty() ? String.join("; ", sigReasons) : "known-malware hash (threat feed)";
+                    String why = String.join("; ", sigReasons);
                     File trusted = TrustedBackups.find(guardFolder, null, jar.getName(), scanner);
                     if (trusted != null && quarantineFile(jar, rel, quarantine) && copy(trusted, jar)) {
                         vault.trust(jar, rel);

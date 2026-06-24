@@ -1,0 +1,15 @@
+name: GuardioTester
+version: '${project.version}'
+main: com.fizz.gtest.GuardioTester
+api-version: '1.21'
+author: Fizz
+description: Harmless test harness for Guardio — generates decoys that trip each detection layer.
+commands:
+  gtest:
+    description: Guardio test harness.
+    usage: "/gtest <help|signature|heuristic|feedtest|tamper|hash <jar>|id|clean>"
+    permission: gtest.admin
+permissions:
+  gtest.admin:
+    description: Use the Guardio test harness.
+    default: op

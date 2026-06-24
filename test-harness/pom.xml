@@ -5,12 +5,12 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.fizz</groupId>
-    <artifactId>testvirus</artifactId>
+    <artifactId>guardiotester</artifactId>
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
-    <name>TestVirus</name>
-    <description>HARMLESS PluginGuard test target — carries a fake signature, does nothing malicious.</description>
+    <name>GuardioTester</name>
+    <description>Harmless test harness that exercises every detection layer of Guardio.</description>
 
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
@@ -34,14 +34,7 @@
     </dependencies>
 
     <build>
-        <finalName>${project.name}-${project.version}</finalName>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
-            </plugin>
-        </plugins>
+        <finalName>GuardioTester</finalName>
         <resources>
             <resource>
                 <directory>src/main/resources</directory>

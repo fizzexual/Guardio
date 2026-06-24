@@ -1,6 +1,0 @@
-name: TestVirus
-version: '${project.version}'
-main: com.fizz.testvirus.TestVirus
-api-version: '1.21'
-author: Fizz
-description: HARMLESS PluginGuard test target. Carries a FAKE signature so the guard flags it; does nothing malicious.

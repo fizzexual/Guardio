@@ -96,6 +96,14 @@ the host's own flags are forwarded), `use-agent`, `restart-on-crash`, `restart-f
 `guardio/sources.yml` (plugin) — download overrides (`modrinth:<slug>` / `url:<jar>` / `github:<owner/repo>`).
 
 ## Testing
-`test-virus/` is a **harmless** test plugin: it carries a fake signature (a benign `javassist.ws.Marker`
-class) so PluginGuard flags and quarantines it — it performs no malicious action. Build it and drop it in
-`plugins/` to see the guard work.
+`test-harness/` builds **GuardioTester** — a 100% harmless plugin that exercises every Guardio layer. It never
+opens a connection, runs a command, or loads code; on request it writes small **inert** decoy jars into
+`plugins/`. Build it (`mvn -f test-harness/pom.xml package`), drop `GuardioTester.jar` in `plugins/`, then:
+- `/gtest signature` — decoy that trips signature detection (entry + content) → quarantined
+- `/gtest heuristic` — decoy that trips the report‑only heuristic scan → flagged, left in place
+- `/gtest feedtest` — clean jar + adds its hash to the threat feed → quarantined by hash after restart
+- `/gtest tamper` — integrity test: trust it, modify it, rescan → restored from the vault
+- `/gtest id` — verify `/guardio reload GuardioTester` doesn't double‑register
+- `/gtest clean` — delete the decoys
+
+(Its own malware markers are stored Base64‑encoded so Guardio doesn't flag the tester itself.)

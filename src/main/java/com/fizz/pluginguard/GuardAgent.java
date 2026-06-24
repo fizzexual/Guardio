@@ -66,6 +66,19 @@ public final class GuardAgent {
             for (File jar : jars) {
                 String rel = Vault.rel(serverRoot, jar);
                 String sha = Hashing.sha256(jar);
+                if (feed.contains(sha)) {
+                    // known-malware hash is authoritative — quarantine even if previously mapped/trusted
+                    if (quarantine(jar, rel, quarantine)) {
+                        blocked++;
+                        report.add("BLOCKED " + rel + " :: known-malware hash (threat feed)");
+                        logRed("BLOCKED " + rel + " -> known-malware hash (threat feed)");
+                    } else {
+                        lockedInfected = rel;
+                        report.add("LOCKED-INFECTED " + rel + " :: known-malware hash (threat feed)");
+                        logRed("CANNOT remove infected (locked) jar: " + rel + " -> known-malware hash (threat feed)");
+                    }
+                    continue;
+                }
                 if (vault.has(rel)) {
                     if (sha != null && sha.equals(vault.hash(rel))) {
                         unchanged++;
