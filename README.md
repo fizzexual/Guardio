@@ -8,7 +8,14 @@ and **auto‑heals** infected/tampered server jars — built after a self‑spre
 > persistence, stolen credentials, or a trojaned OS/server are outside any plugin's reach. Clean the host and
 > rotate credentials too.
 
+One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and **plugin** (in `plugins/`).
+
 ## What it does
+- **Launcher** (`java -jar Guardio.jar`) — the strongest mode. Runs *before* the server as the parent process,
+  so it can clean and **heal the whole tree including the server jar itself** (download a clean copy from the
+  official Purpur/Paper URL when it's infected, modified, or missing), then launches + supervises the server as
+  a subprocess (with the agent + plugin active inside). Because it runs before any plugin, the infector never
+  executes during a guarded boot, so it can't tamper with Guardio mid‑run; it also self‑hash‑checks each start.
 - **Pre‑load agent** (`-javaagent`) — runs in `premain`, before any plugin loads, so jars are unlocked. This is
   the only true "before everything" hook (a `plugin.yml` can't guarantee it).
 - **Whole‑server scope** — the top‑level server jar + every jar under configurable roots (default `plugins` +
@@ -23,13 +30,21 @@ and **auto‑heals** infected/tampered server jars — built after a self‑spre
   Premium/private plugins can't be auto‑fetched and are flagged for manual reinstall.
 
 ## Install
-1. Drop `PluginGuard-1.0.0.jar` in `plugins/`.
-2. Add the agent to your start command, before `-jar`:
-   ```
-   java -Xmx4G -javaagent:plugins/PluginGuard-1.0.0.jar -jar paper.jar nogui
-   ```
-3. Start once on a **clean** install, then `/guard trust all` to lock in the baseline (auto‑map does this for
-   new clean jars too).
+
+**Recommended — launcher mode** (guards the whole server, incl. the server jar):
+1. Put `PluginGuard-1.0.0.jar` in `plugins/`.
+2. Start the server through it: `java -jar plugins/PluginGuard-1.0.0.jar`
+3. First run auto‑creates `guardio.properties` (server jar, the official download URL, heap, restart flag).
+   It then scans/heals the tree and launches + supervises the server. Do the first run on a **clean** install
+   so the baseline is clean.
+
+**Or agent‑only mode** (guards plugins + libraries, detects the server jar but can't heal it live):
+```
+java -Xmx4G -javaagent:plugins/PluginGuard-1.0.0.jar -jar paper.jar nogui
+```
+
+Either way, after the first clean boot the vault baseline is set (auto‑map handles new clean jars; `/guard
+trust all` forces it).
 
 ## Commands (`pluginguard.admin` / op)
 - `/guard scan` — rescan now + report

@@ -54,6 +54,7 @@
                 <configuration>
                     <archive>
                         <manifestEntries>
+                            <Main-Class>com.fizz.pluginguard.GuardioLauncher</Main-Class>
                             <Premain-Class>com.fizz.pluginguard.GuardAgent</Premain-Class>
                             <Agent-Class>com.fizz.pluginguard.GuardAgent</Agent-Class>
                             <Can-Retransform-Classes>false</Can-Retransform-Classes>
