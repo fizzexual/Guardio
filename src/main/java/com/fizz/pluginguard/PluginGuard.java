@@ -95,6 +95,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     private final Map<String, String> shaCache = new HashMap<>(); // path|mtime|size -> sha (executor-thread only)
     private Map<String, String> prevSnapshot = new HashMap<>();    // rel -> sha, from the previous scan
     private FileWatcher watcher;
+    private DownloadServer downloadServer;
 
     @Override
     public void onLoad() {
@@ -189,6 +190,23 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
             watcher.start();
             getLogger().info("Real-time watcher active on: " + roots);
         }
+        if (config.getBoolean("download-server.enabled", false)) {
+            try {
+                downloadServer = new DownloadServer(config.getInt("download-server.port", 20010),
+                        config.getString("download-server.token", ""),
+                        config.getBoolean("download-server.localhost-only", true),
+                        config.getBoolean("download-server.allow-quarantine", false), home);
+                downloadServer.start();
+                if (downloadServer.isDisabled()) {
+                    getLogger().warning("download-server enabled but no token set — endpoint NOT started.");
+                } else {
+                    getLogger().info("download endpoint listening on port " + config.getInt("download-server.port", 20010)
+                            + (config.getBoolean("download-server.localhost-only", true) ? " (localhost only)" : " (ALL interfaces)"));
+                }
+            } catch (Exception ex) {
+                getLogger().warning("could not start download endpoint: " + ex.getMessage());
+            }
+        }
         if (config.getBoolean("general.update-check", true)) {
             Bukkit.getScheduler().runTaskAsynchronously(this, this::checkUpdate);
         }
@@ -202,6 +220,9 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor, Ta
     public void onDisable() {
         if (watcher != null) {
             watcher.stop();
+        }
+        if (downloadServer != null) {
+            downloadServer.stop();
         }
         if (scanExecutor != null) {
             scanExecutor.shutdownNow();

@@ -90,6 +90,7 @@ public final class GuardioLauncher {
         banner("Guardio launcher - guarding the whole server BEFORE it loads...");
         selfCheck(guardFolder);
         ensurePluginCopy(serverRoot, selfJar); // keep a synced copy in plugins/ so the in-server plugin loads
+        safeMode(serverRoot, guardFolder);     // hold/restore un-verified plugins if guardio.safemode is set
         scanAndHeal(serverRoot, guardFolder, cfg);
 
         if (scanOnly) {
@@ -124,6 +125,53 @@ public final class GuardioLauncher {
                     logRed("could not move " + j.getName() + " into " + SERVERJAR_DIR + "/: " + ex.getMessage());
                 }
                 return;
+            }
+        }
+    }
+
+    /** Safe-mode boot: while a {@code guardio.safemode} flag file exists, hold any plugin that doesn't match the
+     *  (prior) vault baseline in guardio/safemode-held/ so only verified plugins load; restore them when removed. */
+    private static void safeMode(File serverRoot, File guardFolder) {
+        File flag = new File(serverRoot, "guardio.safemode");
+        File held = new File(guardFolder, "safemode-held");
+        Vault vault = new Vault(guardFolder);
+        if (flag.exists()) {
+            int n = 0;
+            for (File jar : Roots.listJars(serverRoot, List.of("plugins"), guardFolder)) {
+                String rel = Vault.rel(serverRoot, jar);
+                String sha = Hashing.sha256(jar);
+                boolean verified = vault.has(rel) && sha != null && sha.equals(vault.hash(rel));
+                if (!verified && copy(jar, new File(held, rel)) && jar.delete()) {
+                    n++;
+                }
+            }
+            logRed("SAFE MODE: held " + n + " un-verified plugin(s) in guardio/safemode-held/. Only vault-verified "
+                    + "plugins will load. Delete 'guardio.safemode' to restore them.");
+        } else if (held.isDirectory()) {
+            List<File> jars = new ArrayList<>();
+            collectJars(held, jars);
+            int n = 0;
+            for (File jar : jars) {
+                if (copy(jar, new File(serverRoot, Vault.rel(held, jar))) && jar.delete()) {
+                    n++;
+                }
+            }
+            if (n > 0) {
+                banner("safe mode off - restored " + n + " held plugin(s) to plugins/.");
+            }
+        }
+    }
+
+    private static void collectJars(File dir, List<File> out) {
+        File[] fs = dir.listFiles();
+        if (fs == null) {
+            return;
+        }
+        for (File f : fs) {
+            if (f.isDirectory()) {
+                collectJars(f, out);
+            } else if (f.getName().toLowerCase(Locale.ROOT).endsWith(".jar")) {
+                out.add(f);
             }
         }
     }
@@ -239,7 +287,7 @@ public final class GuardioLauncher {
             String rel = Vault.rel(serverRoot, jar);
             String sha = Hashing.sha256(jar);
             if (feed.contains(sha)) {
-                // a known-malware hash is authoritative — quarantine even if this jar was previously mapped/trusted
+                // a known-malware hash is authoritative - quarantine even if this jar was previously mapped/trusted
                 File trusted = TrustedBackups.find(guardFolder, null, jar.getName(), scanner);
                 if (trusted != null && quarantineFile(jar, rel, quarantine) && copy(trusted, jar)) {
                     vault.trust(jar, rel);
@@ -376,7 +424,7 @@ public final class GuardioLauncher {
             }
             subprocess = true;
         } else {
-            subprocess = false; // exotic / blocking main — safe to try in-process
+            subprocess = false; // exotic / blocking main - safe to try in-process
         }
 
         while (true) {
@@ -420,7 +468,7 @@ public final class GuardioLauncher {
     /** True for server bootstraps that must run as their own process (can't be hosted in-process). */
     private static boolean needsSubprocess(String mc) {
         if (mc == null) {
-            return true; // unknown — be safe, use a subprocess
+            return true; // unknown - be safe, use a subprocess
         }
         String low = mc.toLowerCase(Locale.ROOT);
         return mc.equals("io.papermc.paperclip.Main")       // Paper / Purpur / Folia (paperclip)
@@ -443,7 +491,7 @@ public final class GuardioLauncher {
             Thread.currentThread().setContextClassLoader(cl);
             Class<?> m = Class.forName(mainClass, true, cl);
             m.getMethod("main", String[].class).invoke(null, (Object) serverArgs.toArray(new String[0]));
-            return true; // server ran (and its main returned) — a normal stop
+            return true; // server ran (and its main returned) - a normal stop
         } catch (Throwable t) {
             Throwable cause = (t.getCause() != null) ? t.getCause() : t;
             logRed("in-process launch failed: " + cause.getClass().getSimpleName()
@@ -562,7 +610,7 @@ public final class GuardioLauncher {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
-    /** True when this JVM was started by javaw.exe (i.e. the jar was double-clicked) — no console. */
+    /** True when this JVM was started by javaw.exe (i.e. the jar was double-clicked) - no console. */
     private static boolean launchedByJavaw() {
         try {
             return ProcessHandle.current().info().command()

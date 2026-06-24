@@ -56,6 +56,18 @@ threat-feed:
   url: ""
 
 # ----------------------------------------------------------------------------
+#  Local download endpoint — pull vault jars / reports off a headless host without FTP.
+#  SECURITY: requires a token; defaults to localhost-only; quarantined samples are NOT served unless
+#  you explicitly enable it. Leave disabled (and the token blank) unless you need it.
+# ----------------------------------------------------------------------------
+download-server:
+  enabled: false
+  port: 20010
+  token: ""                # REQUIRED to start — set a long random secret
+  localhost-only: true     # bind 127.0.0.1 only (recommended)
+  allow-quarantine: false  # serve quarantined (infected) samples too — off by default
+
+# ----------------------------------------------------------------------------
 #  Discord alerts. The launcher (pre-boot) reads `discord-webhook` in guardio.properties;
 #  the plugin uses the webhook below, FALLING BACK to that one if this is blank — set it once.
 # ----------------------------------------------------------------------------
