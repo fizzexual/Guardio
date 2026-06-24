@@ -161,3 +161,14 @@ layer is advisory by design and must not be interpreted as a definitive verdict.
 `test-harness/` builds **GuardioTester** — a non‑malicious instrumentation plugin that emits inert decoy
 artifacts (Base64‑encoded markers, so the harness itself is not flagged) exercising L1–L4, quarantine/restore,
 threat‑feed‑by‑hash, and reload idempotency via `/gtest {signature│heuristic│feedtest│tamper│id│clean}`.
+
+## 11. Self‑hardening & build
+- **Self‑integrity (anti‑injection).** The launcher and the pre‑load agent record Guardio's own jar SHA‑256 on
+  the first clean run (`guardio/guardio.self`) and verify it on every boot — *before* the plugin loads. If the
+  infector injects classes into Guardio's own jar, the bytes change and `self-protect=refuse` aborts startup
+  (exit 3) with an alert. **Honest scope:** this stops the *automated* malware (it won't re‑baseline Guardio's
+  record); a *targeted human* who controls the box can patch the check out — no self‑check can defeat that.
+- **Obfuscation.** `mvn package -Prelease` runs ProGuard to rename all internal classes and strip debug info
+  (deters decompilation / cracking) while keeping the entry points so it still loads. Plain `mvn package` stays
+  readable for development. Obfuscation is *deterrence*, not invincibility.
+- **Build:** `mvn package` → readable dev jar; `mvn package -Prelease` → the shippable obfuscated jar.
