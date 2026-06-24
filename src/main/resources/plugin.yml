@@ -1,4 +1,4 @@
-name: PluginGuard
+name: Guardio
 version: '${project.version}'
 main: com.fizz.pluginguard.PluginGuard
 api-version: '1.21'
@@ -7,10 +7,10 @@ author: Fizz
 description: Detects, quarantines, and restores tampered/infected plugin jars on load.
 commands:
   guard:
-    description: PluginGuard control — scan, status, trust a clean baseline, restore.
+    description: Guardio control — scan, status, trust a clean baseline, restore.
     usage: "/guard <scan|status|trust [all|<jar>]|restore <jar>|allow <jar>|heal>"
-    permission: pluginguard.admin
+    permission: guardio.admin
 permissions:
-  pluginguard.admin:
-    description: Manage PluginGuard.
+  guardio.admin:
+    description: Manage Guardio.
     default: op

@@ -47,7 +47,7 @@ public final class GuardAgent {
         try {
             File serverRoot = ((args != null && !args.isBlank()) ? new File(args.trim()) : new File("."))
                     .getAbsoluteFile();
-            File guardFolder = new File(serverRoot, "plugins/PluginGuard");
+            File guardFolder = new File(serverRoot, "guardio");
             File quarantine = new File(guardFolder, "quarantine");
             Vault vault = new Vault(guardFolder);
             JarScanner scanner = new JarScanner(ENTRY_SIGS, CONTENT_SIGS);
@@ -171,10 +171,10 @@ public final class GuardAgent {
     }
 
     private static void log(String msg) {
-        System.out.println("[PluginGuard-Agent] " + msg);
+        System.out.println("[Guardio-Agent] " + msg);
     }
 
     private static void logRed(String msg) {
-        System.out.println(RED + "[PluginGuard-Agent] " + msg + RESET);
+        System.out.println(RED + "[Guardio-Agent] " + msg + RESET);
     }
 }

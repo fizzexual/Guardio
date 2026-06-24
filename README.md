@@ -11,7 +11,7 @@ and **auto‑heals** infected/tampered server jars — built after a self‑spre
 One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and **plugin** (in `plugins/`).
 
 ## What it does
-- **Launcher** (`java -jar Guardio.jar`) — the strongest mode, and **host‑agnostic**: make Guardio the jar your
+- **Launcher** (`java -jar guardio-v1.0.0.jar`) — the strongest mode, and **host‑agnostic**: make Guardio the jar your
   host launches and it runs *before* the server, so it can clean and **heal the whole tree including the server
   jar itself** (download a clean copy from the official Purpur/Paper URL when it's infected, modified, or
   missing), then runs the real server. It **forwards the host's own JVM flags + program args** (heap, GC,
@@ -34,33 +34,41 @@ One jar, three modes: **launcher** (`java -jar`), **agent** (`-javaagent`), and 
   source (Modrinth, or a `sources.yml` override), **verified twice** (source SHA‑512 + a re‑scan) before use.
   Premium/private plugins can't be auto‑fetched and are flagged for manual reinstall.
 
+## Layout
+Guardio owns a clean, self-contained tree:
+```
+<server root>/
+├── guardio-v1.0.0.jar          ← the launcher you run
+├── guardio/                    ← Guardio's home
+│   ├── serverjar/<server>.jar  ← the real server jar lives here
+│   ├── vault/  quarantine/
+│   └── guardio.properties, config.yml, sources.yml, reports
+└── plugins/  libraries/  world/  …   ← plugins/ also gets a synced Guardio copy (the in-server layer)
+```
+
 ## Install
 
 **Recommended — launcher mode** (guards the whole server, incl. the server jar):
-1. Put `PluginGuard-1.0.0.jar` in `plugins/`.
-2. Start the server through it: `java -jar plugins/PluginGuard-1.0.0.jar`
-3. First run auto‑creates `guardio.properties` (server jar, the official download URL, heap, restart flag).
-   It then scans/heals the tree and launches + supervises the server. Do the first run on a **clean** install
-   so the baseline is clean.
+1. Put `guardio-v1.0.0.jar` in the server root, and your server jar in the root too (Guardio moves it into
+   `guardio/serverjar/`), or place it directly in `guardio/serverjar/`.
+2. Run it: `java -Xmx4G -jar guardio-v1.0.0.jar`  (put `-Xmx`/flags on the Guardio command — it forwards them).
+3. First run creates `guardio/` (config + vault), moves the server jar into `guardio/serverjar/`, drops a synced
+   plugin copy in `plugins/`, scans/heals the whole tree, then launches + supervises the server. Do the first
+   run on a **clean** install so the baseline is clean.
 
-**On a hosting panel (Pterodactyl, Multicraft, shared hosts, …):** the panel always runs *some* jar —
-point it at Guardio and Guardio launches the real server for you:
-- Put both jars in the server folder (the real server e.g. `paper.jar`, plus Guardio).
-- Make Guardio the launched jar — either **rename Guardio to the jar the panel runs** (often `server.jar`),
-  or set the panel's "jar file" / startup command to Guardio's jar.
-- Set `server-jar=` in `guardio.properties` to the real server jar (Guardio also auto‑detects it, skipping
-  itself). The panel's `-Xmx`/flags are forwarded automatically; `launch-mode=in-process` keeps it to one
-  process so the panel's memory cap and console behave normally.
+**On a hosting panel (Pterodactyl, Multicraft, shared hosts, …):** point the panel at `guardio-v1.0.0.jar`
+(rename it to whatever jar the panel runs — often `server.jar` — or set the panel's jar/startup field). Guardio
+finds the real server jar in `guardio/serverjar/` (auto-detecting + moving one if needed) and runs it, forwarding
+the panel's `-Xmx`/flags + console. `launch-mode=in-process` keeps it to a single process for hard memory caps.
 
-**Or agent‑only mode** (guards plugins + libraries, detects the server jar but can't heal it live):
+**Or agent‑only mode** (no launcher; guards plugins + libraries, detects the server jar but can't heal it live):
 ```
-java -Xmx4G -javaagent:plugins/PluginGuard-1.0.0.jar -jar paper.jar nogui
+java -Xmx4G -javaagent:guardio-v1.0.0.jar -jar guardio/serverjar/<server>.jar nogui
 ```
 
-Either way, after the first clean boot the vault baseline is set (auto‑map handles new clean jars; `/guard
-trust all` forces it).
+After the first clean boot the vault baseline is set (auto‑map handles new clean jars; `/guard trust all` forces it).
 
-## Commands (`pluginguard.admin` / op)
+## Commands (`guardio.admin` / op)
 - `/guard scan` — rescan now + report
 - `/guard status` — vault size, last scan, staged fixes
 - `/guard trust [all|<jar>]` — (re)map clean jar(s) as the trusted baseline
@@ -69,11 +77,11 @@ trust all` forces it).
 - `/guard heal` — download clean replacements for quarantined plugins
 
 ## Config
-`guardio.properties` (launcher, in the server root, auto‑created) — `server-jar`, `server-jar-url`,
-`launch-mode` (`auto`/`in-process`/`subprocess`), `java-args`/`server-args` (fallback only — the host's own
-flags are forwarded), `use-agent`, `restart-on-crash`, `restart-flag`, `scan-roots`.
-`config.yml` (plugin) — scan roots, signatures, auto‑map/quarantine/restore/download, whitelist, shutdown‑on‑infection.
-`sources.yml` (plugin) — download overrides (`modrinth:<slug>` / `url:<jar>` / `github:<owner/repo>`).
+`guardio/guardio.properties` (launcher, auto‑created) — `server-jar` (path under `guardio/serverjar/`),
+`server-jar-url`, `launch-mode` (`auto`/`in-process`/`subprocess`), `java-args`/`server-args` (fallback only —
+the host's own flags are forwarded), `use-agent`, `restart-on-crash`, `restart-flag`, `scan-roots`.
+`guardio/config.yml` (plugin) — scan roots, signatures, auto‑map/quarantine/restore/download, whitelist, shutdown‑on‑infection.
+`guardio/sources.yml` (plugin) — download overrides (`modrinth:<slug>` / `url:<jar>` / `github:<owner/repo>`).
 
 ## Testing
 `test-virus/` is a **harmless** test plugin: it carries a fake signature (a benign `javassist.ws.Marker`

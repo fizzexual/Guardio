@@ -13,6 +13,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -45,6 +46,8 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     private Vault vault;
     private JarScanner scanner;
     private File serverRoot;
+    private File home; // <serverRoot>/guardio — shared home (vault, quarantine, config) for launcher + agent + plugin
+    private FileConfiguration config;
     private List<String> roots;
     private List<String> whitelist;
     private boolean autoQuarantine;
@@ -63,28 +66,32 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
 
     @Override
     public void onLoad() {
-        saveDefaultConfig();
-        FileConfiguration c = getConfig();
         this.serverRoot = resolveServerRoot(); // robust: Paper's plugin remapper can leave getDataFolder()'s parents null
-        this.vault = new Vault(getDataFolder());
+        this.home = new File(serverRoot, "guardio"); // shared home with the launcher + agent (not plugins/<name>)
+        this.home.mkdirs();
+
+        File cfgFile = new File(home, "config.yml");
+        copyResourceIfMissing("config.yml", cfgFile);
+        FileConfiguration c = YamlConfiguration.loadConfiguration(cfgFile);
+        this.config = c;
+
+        this.vault = new Vault(home);
         this.scanner = new JarScanner(c.getStringList("entry-signatures"), c.getStringList("content-signatures"));
         this.roots = c.getStringList("scan-roots").isEmpty() ? Roots.DEFAULTS : c.getStringList("scan-roots");
-        this.whitelist = Whitelist.load(getDataFolder());
+        this.whitelist = Whitelist.load(home);
         this.autoQuarantine = c.getBoolean("auto-quarantine", true);
         this.autoRestore = c.getBoolean("auto-restore", true);
         this.autoMap = c.getBoolean("auto-map", true);
         this.autoDownload = c.getBoolean("auto-download", false);
         this.alertOps = c.getBoolean("alert-ops", true);
         this.shutdownOnInfection = c.getBoolean("shutdown-on-infection", false);
-        if (!new File(getDataFolder(), "sources.yml").exists()) {
-            saveResource("sources.yml", false);
-        }
+        copyResourceIfMissing("sources.yml", new File(home, "sources.yml"));
         this.healer = new Healer(scanner);
         this.sources = loadSources();
         String gv = c.getString("download-game-version", "");
         this.gameVersion = (gv == null || gv.isBlank()) ? Bukkit.getBukkitVersion().split("-")[0] : gv.trim();
 
-        Runtime.getRuntime().addShutdownHook(new Thread(this::applyPending, "PluginGuard-remediate"));
+        Runtime.getRuntime().addShutdownHook(new Thread(this::applyPending, "Guardio-remediate"));
 
         if (c.getBoolean("scan-on-load", true)) {
             getLogger().info("Scanning the server (plugins + libraries + server jar) for tampering/infection...");
@@ -110,7 +117,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
         if (autoDownload) {
             Bukkit.getScheduler().runTaskAsynchronously(this, () -> heal(null));
         }
-        int mins = getConfig().getInt("periodic-scan-minutes", 0);
+        int mins = config.getInt("periodic-scan-minutes", 0);
         if (mins > 0) {
             long ticks = mins * 60L * 20L;
             Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
@@ -148,9 +155,27 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
         return new File(".").getAbsoluteFile();
     }
 
+    /** Copies a bundled resource (config.yml / sources.yml) into Guardio's home if it isn't there yet. */
+    private void copyResourceIfMissing(String name, File dest) {
+        if (dest.exists()) {
+            return;
+        }
+        try (InputStream in = getResource(name)) {
+            if (in != null) {
+                File p = dest.getParentFile();
+                if (p != null) {
+                    p.mkdirs();
+                }
+                Files.copy(in, dest.toPath());
+            }
+        } catch (IOException ignored) {
+            // non-fatal — defaults apply
+        }
+    }
+
     private List<ScanResult> runScan(boolean remediate) {
         List<ScanResult> results = new ArrayList<>();
-        for (File jar : Roots.listJars(serverRoot, roots, getDataFolder())) {
+        for (File jar : Roots.listJars(serverRoot, roots, home)) {
             String rel = Vault.rel(serverRoot, jar);
             String sha = Hashing.sha256(jar);
             List<String> reasons = scanner.scan(jar);
@@ -180,7 +205,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     /** Queues a quarantine (+ restore if the vault has a clean copy) to run when jars unlock at shutdown. */
     private void stageRemediation(File jar, String rel) {
         File clean = (autoRestore && vault.has(rel)) ? vault.file(rel) : null;
-        pending.add(new Pending(jar, rel, clean, new File(getDataFolder(), "quarantine")));
+        pending.add(new Pending(jar, rel, clean, new File(home, "quarantine")));
         if (clean == null) {
             getLogger().warning("  no clean copy in vault for " + rel + " — it will be quarantined; reinstall a clean one.");
         }
@@ -212,7 +237,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
             }
         }
         try {
-            Files.write(new File(getDataFolder(), "last-remediation.txt").toPath(), log);
+            Files.write(new File(home, "last-remediation.txt").toPath(), log);
         } catch (IOException ignored) {
             // best effort — console may already be down at shutdown
         }
@@ -221,7 +246,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     // ---- Auto-heal (download clean replacements for quarantined plugins) --
 
     private void heal(CommandSender sender) {
-        File quarantine = new File(getDataFolder(), "quarantine");
+        File quarantine = new File(home, "quarantine");
         List<File> infectedFiles = new ArrayList<>();
         collectInfected(quarantine, infectedFiles);
         Set<String> seen = new HashSet<>();
@@ -269,7 +294,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
         }
         if (!report.isEmpty()) {
             try {
-                Files.write(new File(getDataFolder(), "heal-report.txt").toPath(), report);
+                Files.write(new File(home, "heal-report.txt").toPath(), report);
             } catch (IOException ignored) {
                 // non-fatal
             }
@@ -328,7 +353,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
 
     private Map<String, String> loadSources() {
         Map<String, String> m = new HashMap<>();
-        File f = new File(getDataFolder(), "sources.yml");
+        File f = new File(home, "sources.yml");
         if (f.isFile()) {
             ConfigurationSection ov = YamlConfiguration.loadConfiguration(f).getConfigurationSection("overrides");
             if (ov != null) {
@@ -391,8 +416,8 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                     return true;
                 }
                 try {
-                    Whitelist.add(getDataFolder(), args[1]);
-                    whitelist = Whitelist.load(getDataFolder());
+                    Whitelist.add(home, args[1]);
+                    whitelist = Whitelist.load(home);
                     File jar = resolveJar(args[1]);
                     if (jar != null) {
                         vault.trust(jar, Vault.rel(serverRoot, jar));
@@ -415,7 +440,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
     private void trust(CommandSender sender, String which) {
         if (which.equalsIgnoreCase("all")) {
             int n = 0;
-            for (File jar : Roots.listJars(serverRoot, roots, getDataFolder())) {
+            for (File jar : Roots.listJars(serverRoot, roots, home)) {
                 if (vault.trust(jar, Vault.rel(serverRoot, jar))) {
                     n++;
                 }
@@ -437,7 +462,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
 
     /** Finds a scanned jar by exact name or by relative path (case-insensitive). */
     private File resolveJar(String arg) {
-        for (File jar : Roots.listJars(serverRoot, roots, getDataFolder())) {
+        for (File jar : Roots.listJars(serverRoot, roots, home)) {
             if (jar.getName().equalsIgnoreCase(arg) || Vault.rel(serverRoot, jar).equalsIgnoreCase(arg)) {
                 return jar;
             }
@@ -479,7 +504,7 @@ public final class PluginGuard extends JavaPlugin implements CommandExecutor {
                         : ""));
         }
         try {
-            Files.write(new File(getDataFolder(), "guard-report.txt").toPath(), lines);
+            Files.write(new File(home, "guard-report.txt").toPath(), lines);
         } catch (IOException ignored) {
             // non-fatal
         }

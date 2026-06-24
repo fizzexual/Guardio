@@ -60,8 +60,9 @@ final class Roots {
         if (canon(f).startsWith(guardPath)) {
             return;
         }
-        if (f.getName().toLowerCase(Locale.ROOT).contains("pluginguard")) {
-            return;
+        String n = f.getName().toLowerCase(Locale.ROOT);
+        if (n.contains("guardio") || n.contains("pluginguard")) {
+            return; // never scan/quarantine Guardio's own jar (root launcher or the plugins/ copy)
         }
         out.add(f);
     }

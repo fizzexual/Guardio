@@ -51,20 +51,25 @@ public final class GuardioLauncher {
     private GuardioLauncher() {
     }
 
+    static final String SERVERJAR_DIR = "guardio/serverjar"; // server jar lives here, relative to the root
+
     public static void main(String[] args) throws Exception {
         boolean scanOnly = Arrays.asList(args).contains("--scan-only");
         File serverRoot = new File(".").getCanonicalFile();
-        File guardFolder = new File(serverRoot, "plugins/PluginGuard");
-        guardFolder.mkdirs();
+        File guardFolder = new File(serverRoot, "guardio"); // Guardio's home: vault, quarantine, config, serverjar/
+        File serverJarDir = new File(serverRoot, SERVERJAR_DIR);
+        serverJarDir.mkdirs();
         File selfJar = ownJar();
-        Props cfg = Props.loadOrCreate(new File(serverRoot, "guardio.properties"),
+
+        // Tidy layout: move a server jar sitting in the root (old layout / fresh upload) into guardio/serverjar/.
+        migrateServerJar(serverRoot, serverJarDir, selfJar);
+
+        Props cfg = Props.loadOrCreate(new File(guardFolder, "guardio.properties"), serverRoot,
                 selfJar == null ? "" : selfJar.getName());
 
-        // Resolve the REAL server jar: config wins, else auto-detect (excluding Guardio's own jar) so it works
-        // even when Guardio is the jar the host launches (e.g. renamed to server.jar).
+        // Resolve the REAL server jar (path relative to root, e.g. guardio/serverjar/purpur-1.21.11.jar).
         if (cfg.get("server-jar", "").isBlank()) {
-            File self = ownJar();
-            String detected = Props.detectServerJar(serverRoot, self == null ? "" : self.getName());
+            String detected = Props.detectServerJar(serverRoot, selfJar == null ? "" : selfJar.getName());
             if (detected != null) {
                 cfg.set("server-jar", detected);
                 banner("auto-detected server jar: " + detected);
@@ -73,6 +78,7 @@ public final class GuardioLauncher {
 
         banner("Guardio launcher - guarding the whole server BEFORE it loads...");
         selfCheck(guardFolder);
+        ensurePluginCopy(serverRoot, selfJar); // keep a synced copy in plugins/ so the in-server plugin loads
         scanAndHeal(serverRoot, guardFolder, cfg);
 
         if (scanOnly) {
@@ -80,6 +86,55 @@ public final class GuardioLauncher {
             return;
         }
         System.exit(launchLoop(serverRoot, guardFolder, cfg, args));
+    }
+
+    /** Moves a server-looking jar from the root into guardio/serverjar/ if that folder has none yet. */
+    private static void migrateServerJar(File serverRoot, File serverJarDir, File selfJar) {
+        File[] already = serverJarDir.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
+        if (already != null && already.length > 0) {
+            return; // server jar already in place
+        }
+        String self = selfJar == null ? "" : selfJar.getName().toLowerCase(Locale.ROOT);
+        File[] rootJars = serverRoot.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
+        if (rootJars == null) {
+            return;
+        }
+        for (File j : rootJars) {
+            String n = j.getName().toLowerCase(Locale.ROOT);
+            if (n.equals(self) || n.contains("guardio") || n.contains("pluginguard")) {
+                continue;
+            }
+            if (n.contains("purpur") || n.contains("paper") || n.contains("spigot")
+                    || n.contains("folia") || n.contains("fabric") || n.contains("server")) {
+                try {
+                    Files.move(j.toPath(), new File(serverJarDir, j.getName()).toPath());
+                    banner("moved server jar " + j.getName() + " into " + SERVERJAR_DIR + "/");
+                } catch (Exception ex) {
+                    logRed("could not move " + j.getName() + " into " + SERVERJAR_DIR + "/: " + ex.getMessage());
+                }
+                return;
+            }
+        }
+    }
+
+    /** Keeps a copy of Guardio in plugins/ (synced by hash) so the in-server plugin layer + /guard commands load. */
+    private static void ensurePluginCopy(File serverRoot, File selfJar) {
+        if (selfJar == null) {
+            return;
+        }
+        try {
+            File pluginsDir = new File(serverRoot, "plugins");
+            pluginsDir.mkdirs();
+            File dest = new File(pluginsDir, selfJar.getName());
+            String selfHash = Hashing.sha256(selfJar);
+            String destHash = dest.isFile() ? Hashing.sha256(dest) : null;
+            if (selfHash != null && !selfHash.equals(destHash)) {
+                Files.copy(selfJar.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                banner("installed/updated the in-server plugin copy: plugins/" + selfJar.getName());
+            }
+        } catch (Exception ex) {
+            logRed("could not place the plugin copy in plugins/: " + ex.getMessage());
+        }
     }
 
     // ---- self-protection -----------------------------------------------
@@ -353,7 +408,7 @@ public final class GuardioLauncher {
             cmd.add("-javaagent:" + self.getPath());
         }
         cmd.add("-jar");
-        cmd.add(realJar.getName());
+        cmd.add(cfg.get("server-jar", realJar.getName())); // path relative to root (e.g. guardio/serverjar/x.jar)
         cmd.addAll(serverArgs);
         banner("launching server (subprocess): " + String.join(" ", cmd));
         Process proc = new ProcessBuilder(cmd).directory(serverRoot).inheritIO().start();
@@ -455,14 +510,14 @@ public final class GuardioLauncher {
     static final class Props {
         private final Properties p = new Properties();
 
-        static Props loadOrCreate(File f, String selfName) throws IOException {
+        static Props loadOrCreate(File f, File serverRoot, String selfName) throws IOException {
             Props pr = new Props();
             if (f.isFile()) {
                 try (InputStream in = new FileInputStream(f)) {
                     pr.p.load(in);
                 }
             } else {
-                pr.writeDefaults(f, selfName);
+                pr.writeDefaults(f, serverRoot, selfName);
             }
             return pr;
         }
@@ -475,13 +530,16 @@ public final class GuardioLauncher {
             p.setProperty(k, v);
         }
 
-        private void writeDefaults(File f, String selfName) throws IOException {
-            File root = f.getCanonicalFile().getParentFile();
-            String jar = detectServerJar(root, selfName);
+        private void writeDefaults(File f, File serverRoot, String selfName) throws IOException {
+            String jar = detectServerJar(serverRoot, selfName); // e.g. guardio/serverjar/purpur-1.21.11.jar
             String ver = (jar == null) ? "" : jar.replaceAll("(?i).*?(\\d+\\.\\d+(?:\\.\\d+)?).*", "$1");
             String url = "";
             if (jar != null && jar.toLowerCase(Locale.ROOT).contains("purpur") && !ver.equals(jar)) {
                 url = "https://api.purpurmc.org/v2/purpur/" + ver + "/latest/download";
+            }
+            File p2 = f.getParentFile();
+            if (p2 != null) {
+                p2.mkdirs(); // ensure /guardio exists before writing guardio.properties into it
             }
             p.setProperty("server-jar", jar == null ? "" : jar);
             p.setProperty("server-jar-url", url);
@@ -499,13 +557,18 @@ public final class GuardioLauncher {
             }
         }
 
-        /** First server-looking jar in root, excluding Guardio itself (by exact name + guardio/pluginguard). */
-        static String detectServerJar(File root, String selfName) {
-            File[] jars = root.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
+        /** Server jar inside guardio/serverjar/ (preferred) or the root, as a path relative to the root. */
+        static String detectServerJar(File serverRoot, String selfName) {
+            File serverJarDir = new File(serverRoot, SERVERJAR_DIR);
+            File[] inDir = serverJarDir.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
+            if (inDir != null && inDir.length > 0) {
+                return SERVERJAR_DIR + "/" + inDir[0].getName(); // whatever sits in guardio/serverjar/ is the server jar
+            }
+            String self = selfName == null ? "" : selfName.toLowerCase(Locale.ROOT);
+            File[] jars = serverRoot.listFiles((d, n) -> n.toLowerCase(Locale.ROOT).endsWith(".jar"));
             if (jars == null) {
                 return null;
             }
-            String self = selfName == null ? "" : selfName.toLowerCase(Locale.ROOT);
             for (File j : jars) {
                 String n = j.getName().toLowerCase(Locale.ROOT);
                 if (n.equals(self) || n.contains("guardio") || n.contains("pluginguard")) {
