@@ -1,4 +1,4 @@
-# Guardio
+# Guardio 🌱
 
 **A multi‑context integrity‑enforcement and malware‑remediation engine for Paper‑family Minecraft servers (1.21+).**
 Guardio operates as a single self‑contained artifact exposing **three JVM entry points** — a process‑supervising
@@ -6,6 +6,10 @@ Guardio operates as a single self‑contained artifact exposing **three JVM entr
 in‑process **Bukkit plugin** — and applies a **four‑layer detection pipeline** over a **content‑addressable,
 path‑mirrored trust store** to detect, quarantine, restore, and autonomously re‑provision tampered or
 weaponized JAR artifacts across the entire server tree.
+
+## About
+
+Guardio is a server-side security tool for owners of Paper and Purpur 1.21 Minecraft servers who worry about infected or cracked plugin jars. It checks every jar against a trusted baseline at three points (before the server JVM starts, before plugins load, and while the server runs) and restores clean copies when a jar changes. Status: a working v1.0.0 Maven build with a test harness; it protects a clean baseline and is not a host-level antivirus, so an already compromised machine still needs cleaning first.
 
 ---
 
